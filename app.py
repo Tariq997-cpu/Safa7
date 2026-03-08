@@ -1,39 +1,78 @@
 import os
+import json
+import gspread
+from google.oauth2.service_account import Credentials
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 import anthropic
 
 app = Flask(__name__)
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-conversation_history = {}
+
+# Google Sheets setup
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SERVICE_ACCOUNT_INFO = json.loads(os.environ.get("GOOGLE_CREDENTIALS", "{}"))
+SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+
+def get_sheet():
+    creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(SHEET_ID)
+    return sh.sheet1
+
+def load_memory():
+    try:
+        sheet = get_sheet()
+        records = sheet.get_all_records()
+        memory = {}
+        for row in records:
+            sender = row.get("sender")
+            messages = json.loads(row.get("messages", "[]"))
+            if sender:
+                memory[sender] = messages
+        return memory
+    except Exception as e:
+        print(f"Memory load error: {e}")
+        return {}
+
+def save_memory(sender, messages):
+    try:
+        sheet = get_sheet()
+        records = sheet.get_all_records()
+        for i, row in enumerate(records):
+            if row.get("sender") == sender:
+                sheet.update(f"B{i+2}", json.dumps(messages))
+                return
+        sheet.append_row([sender, json.dumps(messages)])
+    except Exception as e:
+        print(f"Memory save error: {e}")
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     incoming_msg = request.values.get("Body", "").strip()
     sender = request.values.get("From", "")
-    
-    if sender not in conversation_history:
-        conversation_history[sender] = []
-    
-    conversation_history[sender].append({
-        "role": "user",
-        "content": incoming_msg
-    })
-    
+
+    memory = load_memory()
+    history = memory.get(sender, [])
+
+    history.append({"role": "user", "content": incoming_msg})
+
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1024,
-        system="You are a personal assistant. You help with tasks, research, notes, and reminders. Be concise and helpful.",
-        messages=conversation_history[sender]
+        system="""You are Safa7, a personal AI assistant. You adapt your communication style to the topic — casual and concise for simple things, professional and detailed for important matters. You have a persistent memory and remember everything the user tells you across all conversations. Be proactive, efficient, and helpful.""",
+        messages=history
     )
-    
+
     reply = response.content[0].text
-    
-    conversation_history[sender].append({
-        "role": "assistant",
-        "content": reply
-    })
-    
+    history.append({"role": "assistant", "content": reply})
+
+    # Keep last 50 messages to avoid sheet getting too large
+    if len(history) > 50:
+        history = history[-50:]
+
+    save_memory(sender, history)
+
     resp = MessagingResponse()
     resp.message(reply)
     return str(resp)
