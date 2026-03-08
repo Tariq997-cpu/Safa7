@@ -55,7 +55,6 @@ _gs_client = None
 
 
 def _get_sender_lock(sender):
-    """Per-sender lock — serializes processing so messages don't race."""
     with _sender_locks_meta:
         if sender not in _sender_locks:
             _sender_locks[sender] = threading.Lock()
@@ -65,7 +64,6 @@ def _get_sender_lock(sender):
 # ━━━ Google Sheets Layer ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _gs():
-    """Cached gspread client. MUST be called under _sheet_lock."""
     global _gs_client
     if _gs_client is None:
         creds = Credentials.from_service_account_info(_GS_CREDS, scopes=_GS_SCOPES)
@@ -74,15 +72,10 @@ def _gs():
 
 
 def _sheet(tab=0):
-    """Get worksheet by index. MUST be called under _sheet_lock.
-    Tab 0 = History  (columns: sender | messages)
-    Tab 1 = Profile  (columns: key | value | updated)
-    """
     return _gs().open_by_key(SHEET_ID).get_worksheet(tab)
 
 
 def _init_sheets():
-    """Create Profile tab if missing. Safe to call multiple times."""
     if not _GS_CREDS or not SHEET_ID:
         return
     try:
@@ -189,7 +182,6 @@ def delete_fact(key):
 # ━━━ Messaging ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def split_message(text, limit=MAX_MSG_LEN):
-    """Split at paragraph > sentence > newline > word > hard cut."""
     if len(text) <= limit:
         return [text]
     chunks = []
@@ -234,14 +226,12 @@ def send_error(to, msg="Something went wrong. Please try again in a moment."):
 # ━━━ Security ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def validate_twilio(f):
-    """Verify X-Twilio-Signature using HMAC-SHA1 with Auth Token."""
     @wraps(f)
     def wrapper(*args, **kwargs):
         if app.debug:
             return f(*args, **kwargs)
         sig = request.headers.get("X-Twilio-Signature", "")
         url = request.url
-        # Render terminates SSL — reconstruct correct scheme for validation
         if request.headers.get("X-Forwarded-Proto") == "https":
             url = url.replace("http://", "https://", 1)
         if not twilio_validator.validate(url, request.form, sig):
@@ -256,12 +246,13 @@ SYSTEM_PROMPT = """You are Safa7 — a sharp, discreet AI assistant built for a 
 senior finance professional based in Saudi Arabia.
 
 <style>
-- Default to 2-4 sentences. Go deeper only when asked or when the topic demands it.
-- Match the user's language — Arabic, English, or mixed. Mirror their register.
-- Lead with the number, the fact, the answer. Then context. Zero filler.
-- Market data: state the figure first, then source confidence and staleness risk.
-- Analysis: take a clear position, quantify where possible, flag key risks.
-- Use tables or structured lists only when comparing multiple items.
+- Lead with the number. Always. No preamble.
+- One source, best available. Don't list conflicting sources — pick the most recent reliable one and state it.
+- Maximum 3 sentences for market data unless asked for more.
+- Never say "I recommend checking" — you ARE the check.
+- Match the user's language — Arabic, English, or mixed.
+- Analysis: take a position, quantify risks, no hedging.
+- Tables only when comparing 3+ items side by side.
 </style>
 
 <web_search>
@@ -291,7 +282,6 @@ def _build_system_prompt():
 # ━━━ Commands ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def handle_command(msg, sender):
-    """Returns response string if msg is a command, else None."""
     raw = msg.strip()
     low = raw.lower()
 
@@ -320,7 +310,7 @@ def handle_command(msg, sender):
             f"🤖 {MODEL}\n"
             f"💬 {len(hist)} messages in history\n"
             f"📋 {len(facts)} saved facts\n"
-            f"📏 History limit: {MAX_HISTORY} messages"
+            f"📏 History limit: {30} messages"
         )
 
     if low == "!facts":
@@ -359,7 +349,6 @@ def handle_command(msg, sender):
 # ━━━ Claude ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def call_claude(history):
-    """Call Claude with web search always available. Claude decides when to use it."""
     system = _build_system_prompt()
     tools = [{
         "type": "web_search_20250305",
@@ -377,7 +366,6 @@ def call_claude(history):
         tools=tools, messages=history
     )
 
-    # Handle pause_turn: Claude hit tool limit mid-response
     if response.stop_reason == "pause_turn":
         response = claude.messages.create(
             model=MODEL, max_tokens=1024, system=system, tools=tools,
@@ -394,18 +382,15 @@ def call_claude(history):
 # ━━━ Processing Pipeline ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def process_message(incoming_msg, sender):
-    """Full pipeline: command check → history → Claude → save → reply."""
     lock = _get_sender_lock(sender)
     with lock:
         try:
-            # Commands bypass Claude entirely
             if incoming_msg.startswith("!"):
                 result = handle_command(incoming_msg, sender)
                 if result:
                     send_whatsapp(sender, result)
                     return
 
-            # Load, append, call, save, send
             history = load_history(sender)
             history.append({"role": "user", "content": incoming_msg})
 
