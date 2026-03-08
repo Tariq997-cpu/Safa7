@@ -242,7 +242,7 @@ def validate_twilio(f):
 
 # ━━━ System Prompt ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-SYSTEM_PROMPT = """You are Safa7. You give ONE sentence answers to market data questions. Number first. Source second. Nothing else. No explanations. No caveats. No "however". No "I notice". Just the fact.
+SYSTEM_PROMPT = """You are Safa7. You give ONE sentence answers to market data questions. Number first. Source second. Nothing else. No explanations. No caveats. No "however". No "I notice". No "Based on". No "Let me". Just the fact.
 
 RULES — no exceptions:
 1. Market data: state the number first, source second, one line. Done.
@@ -252,12 +252,16 @@ RULES — no exceptions:
 5. Match user language (Arabic/English/mixed).
 6. No preamble. No hedging. No narrating your search process.
 
-Example of correct response to "What did TASI close at?":
+Example of CORRECT response to "What did TASI close at?":
 "TASI closed at 11,007.19 (+2.14%) on March 8 — Mubasher."
+
+Example of WRONG response (never do this):
+"Based on the search results, I can see... However... Let me search..."
 
 <web_search>
 Use search for: prices, indices, news, rates, earnings, IPOs, regulations.
 Skip search for: definitions, math, general knowledge, stable facts.
+Prefer: saudiexchange.sa, mubasher.info, investing.com, Bloomberg, Reuters.
 Pick ONE best source. State the number. Stop.
 </web_search>
 
@@ -307,7 +311,7 @@ def handle_command(msg, sender):
             f"🤖 {MODEL}\n"
             f"💬 {len(hist)} messages in history\n"
             f"📋 {len(facts)} saved facts\n"
-            f"📏 History limit: {30} messages"
+            f"📏 History limit: {MAX_HISTORY} messages"
         )
 
     if low == "!facts":
@@ -345,6 +349,19 @@ def handle_command(msg, sender):
 
 # ━━━ Claude ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def clean_reply(reply):
+    """Strip search narration lines from Claude's response."""
+    lines = reply.split("\n")
+    noise = [
+        "search result", "let me search", "i can see", "i notice",
+        "i need to", "based on", "however,", "conflicting", "let me",
+        "i'm seeing", "i found", "i will search", "i should search"
+    ]
+    clean = [l for l in lines if not any(p in l.lower() for p in noise)]
+    result = "\n".join(clean).strip()
+    return result if result else reply.strip()
+
+
 def call_claude(history):
     system = _build_system_prompt()
     tools = [{
@@ -373,7 +390,8 @@ def call_claude(history):
         )
 
     parts = [b.text for b in response.content if getattr(b, "type", "") == "text"]
-    return "\n".join(parts).strip() or "I couldn't generate a response. Try again."
+    reply = "\n".join(parts).strip() or "I couldn't generate a response. Try again."
+    return clean_reply(reply)
 
 
 # ━━━ Processing Pipeline ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
