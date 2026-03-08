@@ -4,9 +4,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 import anthropic
 
 app = Flask(__name__)
-
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-
 conversation_history = {}
 
 @app.route("/webhook", methods=["POST"])
@@ -32,7 +30,7 @@ def webhook():
     reply = response.content[0].text
     
     conversation_history[sender].append({
-        "role": "assistant", 
+        "role": "assistant",
         "content": reply
     })
     
@@ -41,4 +39,5 @@ def webhook():
     return str(resp)
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
