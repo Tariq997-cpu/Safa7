@@ -9,7 +9,6 @@ import anthropic
 app = Flask(__name__)
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
-# Google Sheets setup
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 SERVICE_ACCOUNT_INFO = json.loads(os.environ.get("GOOGLE_CREDENTIALS", "{}"))
 SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
@@ -59,25 +58,27 @@ def webhook():
 
     response = client.beta.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=1024,
-        system="""You are Safa7, a personal AI assistant. You adapt your communication style to the topic — casual and concise for simple things, professional and detailed for important matters. You have a persistent memory and remember everything the user tells you across all conversations. When you need current information, news, prices, or anything that requires up-to-date data, use your web search tool. Be proactive, efficient, and helpful.""",
+        max_tokens=2048,
+        system="""You are Safa7, a personal AI assistant. You adapt your communication style to the topic — casual and concise for simple things, professional and detailed for important matters. You have a persistent memory and remember everything the user tells you across all conversations. When you need current information, news, prices, or anything that requires up-to-date data, use your web search tool. Always provide a text answer after searching. Be proactive, efficient, and helpful.""",
         tools=[{"type": "web_search_20250305", "name": "web_search"}],
         messages=history,
         betas=["web-search-2025-03-05"]
     )
 
-    # Extract final text response (after any tool use)
+    # Extract all text blocks from response
     reply = ""
     for block in response.content:
-        if hasattr(block, "text"):
+        block_type = getattr(block, "type", "")
+        if block_type == "text":
             reply += block.text
 
     if not reply:
-        reply = "I searched for that but couldn't find a clear answer. Try rephrasing?"
+        reply = "I found some information but had trouble formatting it. Please try asking again."
+
+    print(f"REPLY: {reply[:100]}", flush=True)
 
     history.append({"role": "assistant", "content": reply})
 
-    # Keep last 50 messages
     if len(history) > 50:
         history = history[-50:]
 
