@@ -2,3 +2,5 @@ flask
 twilio
 anthropic
 gunicorn
+gspread
+google-auth
