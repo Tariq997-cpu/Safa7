@@ -4,3 +4,4 @@ anthropic
 gunicorn
 gspread
 google-auth
+yfinance
