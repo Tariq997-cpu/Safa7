@@ -60,14 +60,23 @@ def webhook():
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1024,
-        system="""You are Safa7, a personal AI assistant. You adapt your communication style to the topic — casual and concise for simple things, professional and detailed for important matters. You have a persistent memory and remember everything the user tells you across all conversations. Be proactive, efficient, and helpful.""",
+        system="""You are Safa7, a personal AI assistant. You adapt your communication style to the topic — casual and concise for simple things, professional and detailed for important matters. You have a persistent memory and remember everything the user tells you across all conversations. When you need current information, news, prices, or anything that requires up-to-date data, use your web search tool. Be proactive, efficient, and helpful.""",
+        tools=[{"type": "web_search_20250305", "name": "web_search"}],
         messages=history
     )
 
-    reply = response.content[0].text
+    # Extract final text response (after any tool use)
+    reply = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            reply += block.text
+
+    if not reply:
+        reply = "I searched for that but couldn't find a clear answer. Try rephrasing?"
+
     history.append({"role": "assistant", "content": reply})
 
-    # Keep last 50 messages to avoid sheet getting too large
+    # Keep last 50 messages
     if len(history) > 50:
         history = history[-50:]
 
