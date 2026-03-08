@@ -1,6 +1,6 @@
 """
 Safa7 — WhatsApp AI Assistant
-Flask + Twilio + Anthropic Claude + Google Sheets
+Flask + Twilio + Anthropic Claude + Google Sheets + yfinance
 """
 
 import os
@@ -11,6 +11,7 @@ from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 
+import yfinance as yf
 import gspread
 from google.oauth2.service_account import Credentials
 from flask import Flask, request, abort
@@ -28,6 +29,29 @@ MODEL = "claude-sonnet-4-20250514"
 MAX_HISTORY = 30
 MAX_MSG_LEN = 1600
 AST = timezone(timedelta(hours=3))
+
+TICKERS = {
+    "tasi": "^TASI",
+    "aramco": "2222.SR",
+    "sabic": "2010.SR",
+    "stc": "7010.SR",
+    "brent": "BZ=F",
+    "wti": "CL=F",
+    "oil": "BZ=F",
+    "usd/sar": "SAR=X",
+    "sar": "SAR=X",
+    "dollar": "SAR=X",
+    "eur/usd": "EURUSD=X",
+    "euro": "EURUSD=X",
+    "gbp/usd": "GBPUSD=X",
+    "pound": "GBPUSD=X",
+    "gold": "GC=F",
+}
+
+MARKET_KEYWORDS = list(TICKERS.keys()) + [
+    "price", "close", "stock", "market", "rate", "index",
+    "trading", "value", "سعر", "سوق", "تاسي", "أرامكو"
+]
 
 
 # ━━━ Clients ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -61,6 +85,52 @@ def _get_sender_lock(sender):
         return _sender_locks[sender]
 
 
+# ━━━ Market Data ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def get_market_data(msg):
+    """Detect market tickers in message and fetch live data via yfinance."""
+    msg_lower = msg.lower()
+    matched = {}
+
+    for keyword, ticker in TICKERS.items():
+        if keyword in msg_lower and ticker not in matched.values():
+            matched[keyword] = ticker
+
+    if not matched:
+        return None
+
+    results = []
+    for keyword, ticker in matched.items():
+        try:
+            t = yf.Ticker(ticker)
+            info = t.fast_info
+            price = info.last_price
+            prev_close = info.previous_close
+
+            if price and prev_close:
+                change = price - prev_close
+                pct = (change / prev_close) * 100
+                direction = "▲" if change >= 0 else "▼"
+                results.append(
+                    f"{keyword.upper()}: {price:,.2f} {direction} {abs(pct):.2f}%"
+                )
+            elif price:
+                results.append(f"{keyword.upper()}: {price:,.2f}")
+        except Exception as e:
+            print(f"[YFINANCE] {ticker}: {e}")
+
+    if not results:
+        return None
+
+    ts = datetime.now(AST).strftime("%H:%M AST")
+    return "\n".join(results) + f"\n_{ts}_"
+
+
+def is_market_query(msg):
+    msg_lower = msg.lower()
+    return any(kw in msg_lower for kw in MARKET_KEYWORDS)
+
+
 # ━━━ Google Sheets Layer ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _gs():
@@ -85,15 +155,14 @@ def _init_sheets():
             if "Profile" not in titles:
                 ws = spreadsheet.add_worksheet(title="Profile", rows=100, cols=3)
                 ws.update(values=[["key", "value", "updated"]], range_name="A1:C1")
-                print("[INIT] Profile tab created")
     except Exception as e:
-        print(f"[INIT] Sheet setup error: {e}")
+        print(f"[INIT] {e}")
 
 
 _init_sheets()
 
 
-# ━━━ History (Tab 0) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━ History ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def load_history(sender):
     with _sheet_lock:
@@ -135,7 +204,7 @@ def clear_history(sender):
             print(f"[SHEETS] clear_history: {e}")
 
 
-# ━━━ Profile Facts (Tab 1) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━ Profile ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def load_profile():
     with _sheet_lock:
@@ -155,9 +224,7 @@ def save_fact(key, value):
             ts = datetime.now(AST).strftime("%Y-%m-%d %H:%M")
             for i, row in enumerate(records):
                 if row.get("key", "").strip().lower() == key.strip().lower():
-                    sheet.update(
-                        values=[[key, value, ts]], range_name=f"A{i+2}:C{i+2}"
-                    )
+                    sheet.update(values=[[key, value, ts]], range_name=f"A{i+2}:C{i+2}")
                     return
             sheet.append_row([key, value, ts])
         except Exception as e:
@@ -213,10 +280,10 @@ def send_whatsapp(to, text):
             if len(chunks) > 1 and i < len(chunks) - 1:
                 time.sleep(0.3)
         except Exception as e:
-            print(f"[TWILIO] send error chunk {i+1}/{len(chunks)}: {e}")
+            print(f"[TWILIO] {e}")
 
 
-def send_error(to, msg="Something went wrong. Please try again in a moment."):
+def send_error(to, msg="Something went wrong. Please try again."):
     try:
         twilio_client.messages.create(body=f"⚠️ {msg}", from_=TWILIO_NUMBER, to=to)
     except Exception:
@@ -245,24 +312,17 @@ def validate_twilio(f):
 SYSTEM_PROMPT = """You are Safa7. You give ONE sentence answers to market data questions. Number first. Source second. Nothing else. No explanations. No caveats. No "however". No "I notice". No "Based on". No "Let me". Just the fact.
 
 RULES — no exceptions:
-1. Market data: state the number first, source second, one line. Done.
-2. If search results show a clear number, use it. Don't debate it.
-3. Never say "I cannot confirm" or "you may need to check" — pick the best number available and state it.
-4. Maximum 2 sentences for any market query.
-5. Match user language (Arabic/English/mixed).
-6. No preamble. No hedging. No narrating your search process.
-
-Example of CORRECT response to "What did TASI close at?":
-"TASI closed at 11,007.19 (+2.14%) on March 8 — Mubasher."
-
-Example of WRONG response (never do this):
-"Based on the search results, I can see... However... Let me search..."
+1. Market data will be injected directly into the conversation when available — trust it completely, it comes from yfinance (live feed). Just present it cleanly.
+2. For non-market questions: be concise, sharp, no fluff.
+3. Maximum 2 sentences for any market query.
+4. Match user language (Arabic/English/mixed).
+5. No preamble. No hedging. No narrating.
+6. Analysis: take a position, quantify risks, no hedging.
 
 <web_search>
-Use search for: prices, indices, news, rates, earnings, IPOs, regulations.
-Skip search for: definitions, math, general knowledge, stable facts.
-Prefer: saudiexchange.sa, mubasher.info, investing.com, Bloomberg, Reuters.
-Pick ONE best source. State the number. Stop.
+Use search ONLY for: news, earnings, IPOs, regulations, geopolitical events.
+Do NOT use search for prices or rates — those come from live data feed.
+Pick ONE best source. State the fact. Stop.
 </web_search>
 
 <user_context>
@@ -324,7 +384,7 @@ def handle_command(msg, sender):
     if low.startswith("!remember "):
         fact = raw[10:].strip()
         if not fact:
-            return "Usage: `!remember key: value` or `!remember [fact]`"
+            return "Usage: `!remember key: value`"
         if ":" in fact and fact.index(":") < 60:
             key, value = fact.split(":", 1)
             key, value = key.strip(), value.strip()
@@ -339,7 +399,7 @@ def handle_command(msg, sender):
     if low.startswith("!forget "):
         key = raw[8:].strip()
         if not key:
-            return "Usage: `!forget [key]` — use `!facts` to see your keys."
+            return "Usage: `!forget [key]`"
         if delete_fact(key):
             return f"🗑️ Removed: *{key}*"
         return f"❌ No fact found matching: *{key}*"
@@ -350,7 +410,6 @@ def handle_command(msg, sender):
 # ━━━ Claude ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def clean_reply(reply):
-    """Strip search narration lines from Claude's response."""
     lines = reply.split("\n")
     noise = [
         "search result", "let me search", "i can see", "i notice",
@@ -367,7 +426,7 @@ def call_claude(history):
     tools = [{
         "type": "web_search_20250305",
         "name": "web_search",
-        "max_uses": 3,
+        "max_uses": 2,
         "user_location": {
             "type": "approximate",
             "country": "SA",
@@ -400,22 +459,35 @@ def process_message(incoming_msg, sender):
     lock = _get_sender_lock(sender)
     with lock:
         try:
+            # Commands
             if incoming_msg.startswith("!"):
                 result = handle_command(incoming_msg, sender)
                 if result:
                     send_whatsapp(sender, result)
                     return
 
+            # Try live market data first
+            if is_market_query(incoming_msg):
+                market_data = get_market_data(incoming_msg)
+                if market_data:
+                    send_whatsapp(sender, market_data)
+                    # Still save to history for context
+                    history = load_history(sender)
+                    history.append({"role": "user", "content": incoming_msg})
+                    history.append({"role": "assistant", "content": market_data})
+                    if len(history) > MAX_HISTORY:
+                        history = history[-MAX_HISTORY:]
+                    save_history(sender, history)
+                    return
+
+            # Fall through to Claude for everything else
             history = load_history(sender)
             history.append({"role": "user", "content": incoming_msg})
-
             reply = call_claude(history)
-
             history.append({"role": "assistant", "content": reply})
             if len(history) > MAX_HISTORY:
                 history = history[-MAX_HISTORY:]
             save_history(sender, history)
-
             send_whatsapp(sender, reply)
 
         except anthropic.RateLimitError:
