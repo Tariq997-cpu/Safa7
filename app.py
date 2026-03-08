@@ -9,8 +9,6 @@ conversation_history = {}
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    import sys
-       print(f"API KEY STARTS WITH: {os.environ.get('ANTHROPIC_API_KEY', 'NOT FOUND')[:20]}", file=sys.stderr)
     incoming_msg = request.values.get("Body", "").strip()
     sender = request.values.get("From", "")
     
