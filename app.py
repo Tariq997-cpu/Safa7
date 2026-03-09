@@ -32,6 +32,7 @@ app = Flask(__name__)
 MODEL = "claude-sonnet-4-20250514"
 MAX_HISTORY = 50
 MAX_MSG_LEN = 1600
+MAX_TOKENS  = 2048
 AST = timezone(timedelta(hours=3))
 
 YF_TICKERS = {
@@ -416,11 +417,13 @@ MEMORY RULES:
 - When told about tasks, meetings, team updates — confirm clearly that you have it.
 
 REMINDER RULES:
-- When the user asks you to remind them of something, extract the reminder details and respond with a JSON block like this:
-  REMINDER_JSON: {{"message": "Call Albahiti", "due": "2026-03-16 09:00", "recurrence": "none"}}
+- When the user asks you to remind them of something, respond with ONLY a brief confirmation line followed by the JSON block. Keep it short.
+- Format exactly like this:
+  Got it. Reminding you to [task] on [date] at [time].
+  REMINDER_JSON: {{"message": "task description", "due": "YYYY-MM-DD HH:MM", "recurrence": "none"}}
 - Recurrence options: "none", "daily", "weekly"
-- For relative times: "tomorrow" = next day at 09:00, "next week" = 7 days from now at 09:00, "every morning at 8am" = daily at 08:00
-- Always confirm the reminder back to the user after setting it.
+- For relative times: "tomorrow" = next day, "next week" = 7 days from now, "every morning at 8am" = daily at 08:00
+- Keep the confirmation text BEFORE the JSON, never after. One line only.
 
 COMMUNICATION RULES:
 - Match user language (Arabic/English/mixed).
@@ -454,29 +457,24 @@ def extract_and_save_reminder(reply: str) -> str:
     if "REMINDER_JSON:" not in reply:
         return reply
     try:
-        parts = reply.split("REMINDER_JSON:")
+        parts      = reply.split("REMINDER_JSON:")
         clean_text = parts[0].strip()
-        json_str = parts[1].strip()
-        start = json_str.index("{")
-        end   = json_str.rindex("}") + 1
-        data  = json.loads(json_str[start:end])
+        json_str   = parts[1].strip()
+        start      = json_str.index("{")
+        end        = json_str.rindex("}") + 1
+        data       = json.loads(json_str[start:end])
 
-        due_dt = datetime.strptime(data["due"], "%Y-%m-%d %H:%M").replace(tzinfo=AST)
+        due_dt     = datetime.strptime(data["due"], "%Y-%m-%d %H:%M").replace(tzinfo=AST)
         recurrence = data.get("recurrence", "none")
         save_reminder(data["message"], due_dt, recurrence)
 
         due_fmt = due_dt.strftime("%A, %B %d at %H:%M AST")
-        rec_txt = ""
-        if recurrence == "daily":
-            rec_txt = " (repeats daily)"
-        elif recurrence == "weekly":
-            rec_txt = " (repeats weekly)"
-
-        confirmation = f"⏰ Reminder set: *{data['message']}* — {due_fmt}{rec_txt}"
-        return f"{clean_text}\n{confirmation}".strip()
+        rec_txt = " (repeats daily)" if recurrence == "daily" else " (repeats weekly)" if recurrence == "weekly" else ""
+        return f"{clean_text}\n⏰ Reminder set: *{data['message']}* — {due_fmt}{rec_txt}".strip()
     except Exception as e:
         print(f"[REMINDER] extract error: {e}", flush=True)
-        return reply
+        # Never crash — strip broken JSON and return clean text
+        return reply.split("REMINDER_JSON:")[0].strip() or reply
 
 
 # ━━━ Commands ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -588,13 +586,13 @@ def call_claude(history: list, profile: dict) -> str:
         }]
 
         response = claude.messages.create(
-            model=MODEL, max_tokens=1024,
+            model=MODEL, max_tokens=MAX_TOKENS,
             system=system, tools=tools, messages=history
         )
 
         if response.stop_reason == "pause_turn":
             response = claude.messages.create(
-                model=MODEL, max_tokens=1024,
+                model=MODEL, max_tokens=MAX_TOKENS,
                 system=system, tools=tools,
                 messages=history + [
                     {"role": "assistant", "content": response.content},
@@ -692,3 +690,8 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+```
+
+Also make sure your `Procfile` says exactly:
+```
+web: gunicorn app:app --config gunicorn.conf.py
