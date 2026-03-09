@@ -2,7 +2,7 @@
 Safa7 — WhatsApp AI Assistant
 Flask + Twilio + Anthropic Claude + Google Sheets + yfinance
 
-Priority: Task management, team tracking, memory recall.
+Priority: Task management, team tracking, memory recall, reminders.
 """
 
 import os
@@ -10,6 +10,7 @@ import json
 import time
 import threading
 import traceback
+import uuid
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
@@ -58,6 +59,7 @@ claude = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 TWILIO_SID    = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_NUMBER = os.environ.get("TWILIO_NUMBER", "whatsapp:+14155238886")
+OWNER_NUMBER  = os.environ.get("OWNER_NUMBER", "whatsapp:+966553424848")
 twilio_client    = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
 twilio_validator = RequestValidator(TWILIO_TOKEN)
 
@@ -70,6 +72,7 @@ SHEET_ID   = os.environ.get("GOOGLE_SHEET_ID")
 
 _history_lock       = threading.Lock()
 _profile_lock       = threading.Lock()
+_reminder_lock      = threading.Lock()
 _sender_locks: dict = {}
 _sender_locks_meta  = threading.Lock()
 _executor           = ThreadPoolExecutor(max_workers=4)
@@ -95,6 +98,10 @@ def _get_worksheet(tab: int):
     return _gs().open_by_key(SHEET_ID).get_worksheet(tab)
 
 
+def _get_worksheet_by_name(name: str):
+    return _gs().open_by_key(SHEET_ID).worksheet(name)
+
+
 def _init_sheets():
     if not _GS_CREDS or not SHEET_ID:
         return
@@ -105,8 +112,11 @@ def _init_sheets():
             ws = spreadsheet.add_worksheet(title="Profile", rows=200, cols=3)
             ws.update(values=[["key", "value", "updated"]], range_name="A1:C1")
             print("[INIT] Profile tab created")
-        else:
-            print("[INIT] Profile tab OK")
+        if "Reminders" not in titles:
+            ws = spreadsheet.add_worksheet(title="Reminders", rows=200, cols=5)
+            ws.update(values=[["id", "message", "due", "recurrence", "status"]], range_name="A1:E1")
+            print("[INIT] Reminders tab created")
+        print("[INIT] Sheets OK")
     except Exception as e:
         print(f"[INIT] {e}")
 
@@ -114,7 +124,7 @@ def _init_sheets():
 _init_sheets()
 
 
-# ━━━ History (Tab 0) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━ History (Sheet1) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def load_history(sender: str) -> list:
     with _history_lock:
@@ -123,9 +133,9 @@ def load_history(sender: str) -> list:
             for row in records:
                 if row.get("sender") == sender:
                     data = json.loads(row.get("messages", "[]"))
-                    print(f"[HISTORY] Loaded {len(data)} messages for {sender}", flush=True)
+                    print(f"[HISTORY] Loaded {len(data)} messages", flush=True)
                     return data
-            print(f"[HISTORY] No history found for {sender}", flush=True)
+            print(f"[HISTORY] No history found", flush=True)
             return []
         except Exception as e:
             print(f"[HISTORY] load error: {traceback.format_exc()}", flush=True)
@@ -140,10 +150,10 @@ def save_history(sender: str, messages: list):
             for i, row in enumerate(records):
                 if row.get("sender") == sender:
                     sheet.update_acell(f"B{i+2}", json.dumps(messages))
-                    print(f"[HISTORY] Saved {len(messages)} messages for {sender}", flush=True)
+                    print(f"[HISTORY] Saved {len(messages)} messages", flush=True)
                     return
             sheet.append_row([sender, json.dumps(messages)])
-            print(f"[HISTORY] Created new row, saved {len(messages)} messages", flush=True)
+            print(f"[HISTORY] Created new row with {len(messages)} messages", flush=True)
         except Exception as e:
             print(f"[HISTORY] save error: {traceback.format_exc()}", flush=True)
 
@@ -161,12 +171,12 @@ def clear_history(sender: str):
             print(f"[HISTORY] clear error: {e}", flush=True)
 
 
-# ━━━ Profile / Facts (Tab 1) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━ Profile (Profile tab) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def load_profile() -> dict:
     with _profile_lock:
         try:
-            records = _get_worksheet(1).get_all_records()
+            records = _get_worksheet_by_name("Profile").get_all_records()
             result = {r["key"]: r["value"] for r in records if r.get("key")}
             print(f"[PROFILE] Loaded {len(result)} facts: {list(result.keys())}", flush=True)
             return result
@@ -178,7 +188,7 @@ def load_profile() -> dict:
 def save_fact(key: str, value: str):
     with _profile_lock:
         try:
-            sheet = _get_worksheet(1)
+            sheet = _get_worksheet_by_name("Profile")
             records = sheet.get_all_records()
             ts = datetime.now(AST).strftime("%Y-%m-%d %H:%M")
             for i, row in enumerate(records):
@@ -195,7 +205,7 @@ def save_fact(key: str, value: str):
 def delete_fact(key: str) -> bool:
     with _profile_lock:
         try:
-            sheet = _get_worksheet(1)
+            sheet = _get_worksheet_by_name("Profile")
             records = sheet.get_all_records()
             for i, row in enumerate(records):
                 if row.get("key", "").strip().lower() == key.strip().lower():
@@ -205,6 +215,96 @@ def delete_fact(key: str) -> bool:
         except Exception as e:
             print(f"[PROFILE] delete error: {e}", flush=True)
             return False
+
+
+# ━━━ Reminders (Reminders tab) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def save_reminder(message: str, due: datetime, recurrence: str = "none"):
+    with _reminder_lock:
+        try:
+            sheet = _get_worksheet_by_name("Reminders")
+            rid = str(uuid.uuid4())[:8]
+            due_str = due.strftime("%Y-%m-%d %H:%M")
+            sheet.append_row([rid, message, due_str, recurrence, "pending"])
+            print(f"[REMINDER] Saved: {message} due {due_str}", flush=True)
+            return rid
+        except Exception as e:
+            print(f"[REMINDER] save error: {e}", flush=True)
+            return None
+
+
+def load_due_reminders() -> list:
+    with _reminder_lock:
+        try:
+            sheet = _get_worksheet_by_name("Reminders")
+            records = sheet.get_all_records()
+            now = datetime.now(AST)
+            due = []
+            for i, row in enumerate(records):
+                if row.get("status") != "pending":
+                    continue
+                try:
+                    due_time = datetime.strptime(row["due"], "%Y-%m-%d %H:%M").replace(tzinfo=AST)
+                    if now >= due_time:
+                        due.append({**row, "_row": i + 2})
+                except Exception:
+                    continue
+            return due
+        except Exception as e:
+            print(f"[REMINDER] load error: {e}", flush=True)
+            return []
+
+
+def mark_reminder_done(row_num: int, recurrence: str, due_str: str):
+    with _reminder_lock:
+        try:
+            sheet = _get_worksheet_by_name("Reminders")
+            if recurrence == "none":
+                sheet.update_acell(f"E{row_num}", "done")
+            else:
+                due = datetime.strptime(due_str, "%Y-%m-%d %H:%M").replace(tzinfo=AST)
+                if recurrence == "daily":
+                    next_due = due + timedelta(days=1)
+                elif recurrence == "weekly":
+                    next_due = due + timedelta(weeks=1)
+                else:
+                    sheet.update_acell(f"E{row_num}", "done")
+                    return
+                sheet.update_acell(f"C{row_num}", next_due.strftime("%Y-%m-%d %H:%M"))
+        except Exception as e:
+            print(f"[REMINDER] mark done error: {e}", flush=True)
+
+
+def list_reminders() -> list:
+    with _reminder_lock:
+        try:
+            sheet = _get_worksheet_by_name("Reminders")
+            records = sheet.get_all_records()
+            return [r for r in records if r.get("status") == "pending"]
+        except Exception as e:
+            print(f"[REMINDER] list error: {e}", flush=True)
+            return []
+
+
+# ━━━ Reminder Scheduler ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def reminder_scheduler():
+    print("[SCHEDULER] Started", flush=True)
+    while True:
+        try:
+            due = load_due_reminders()
+            for reminder in due:
+                msg = f"⏰ *Reminder:* {reminder['message']}"
+                send_whatsapp(OWNER_NUMBER, msg)
+                mark_reminder_done(reminder["_row"], reminder["recurrence"], reminder["due"])
+                print(f"[SCHEDULER] Fired: {reminder['message']}", flush=True)
+        except Exception as e:
+            print(f"[SCHEDULER] Error: {e}", flush=True)
+        time.sleep(60)
+
+
+_scheduler_thread = threading.Thread(target=reminder_scheduler, daemon=True)
+_scheduler_thread.start()
 
 
 # ━━━ Market Data ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -239,13 +339,11 @@ def get_yf_data(msg: str):
 
 
 def is_yf_query(msg: str) -> bool:
-    ml = msg.lower()
-    return any(t in ml for t in YF_TRIGGERS)
+    return any(t in msg.lower() for t in YF_TRIGGERS)
 
 
 def is_saudi_query(msg: str) -> bool:
-    ml = msg.lower()
-    return any(t in ml for t in SAUDI_TRIGGERS)
+    return any(t in msg.lower() for t in SAUDI_TRIGGERS)
 
 
 # ━━━ Messaging ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -307,15 +405,22 @@ def validate_twilio(f):
 
 # ━━━ System Prompt ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-SYSTEM_PROMPT = """You are Safa7 — a sharp, discreet personal assistant for a senior finance professional in Saudi Arabia.
+SYSTEM_PROMPT = """You are Safa7 — a sharp, discreet personal assistant for a senior tourism, hospitality, investment and finance professional based in Saudi Arabia.
 
-YOUR PRIMARY JOB: Help manage tasks, team, priorities, meetings, and follow-ups. You are a trusted chief of staff.
+YOUR PRIMARY JOB: Help manage tasks, team, priorities, meetings, follow-ups, and reminders. You are a trusted chief of staff.
 
 MEMORY RULES:
 - Your profile facts below are your long-term memory. Trust them completely.
 - Conversation history is your short-term memory. Use it fully.
 - If something is in your profile facts OR conversation history — you know it. Never say "I don't have that information."
 - When told about tasks, meetings, team updates — confirm clearly that you have it.
+
+REMINDER RULES:
+- When the user asks you to remind them of something, extract the reminder details and respond with a JSON block like this:
+  REMINDER_JSON: {{"message": "Call Albahiti", "due": "2026-03-16 09:00", "recurrence": "none"}}
+- Recurrence options: "none", "daily", "weekly"
+- For relative times: "tomorrow" = next day at 09:00, "next week" = 7 days from now at 09:00, "every morning at 8am" = daily at 08:00
+- Always confirm the reminder back to the user after setting it.
 
 COMMUNICATION RULES:
 - Match user language (Arabic/English/mixed).
@@ -324,10 +429,10 @@ COMMUNICATION RULES:
 - For market data: number first, source second, one line.
 - Never hedge. Never say "I recommend checking elsewhere."
 - No preamble. No "Based on..." or "Let me search..."
-- If a request is ambiguous or could be executed in multiple ways, ask ONE clarifying question before acting.
+- If a request is ambiguous, ask ONE clarifying question before acting.
 
-MARKET DATA:
-- Saudi market (TASI, stocks): use mubasher.info or saudiexchange.sa.
+MARKET DATA — CRITICAL:
+- TASI and all Saudi market data: ONLY use mubasher.info or saudiexchange.sa. Never use investing.com, Yahoo Finance, or yfinance for Saudi data.
 - Oil/FX: injected directly — present cleanly.
 - Format: "TASI closed at 11,007.19 (+2.14%) — Mubasher."
 
@@ -343,6 +448,37 @@ def build_system_prompt(profile: dict) -> str:
     return SYSTEM_PROMPT.format(profile_facts=pf, current_time=now)
 
 
+# ━━━ Reminder Extraction ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def extract_and_save_reminder(reply: str) -> str:
+    if "REMINDER_JSON:" not in reply:
+        return reply
+    try:
+        parts = reply.split("REMINDER_JSON:")
+        clean_text = parts[0].strip()
+        json_str = parts[1].strip()
+        start = json_str.index("{")
+        end   = json_str.rindex("}") + 1
+        data  = json.loads(json_str[start:end])
+
+        due_dt = datetime.strptime(data["due"], "%Y-%m-%d %H:%M").replace(tzinfo=AST)
+        recurrence = data.get("recurrence", "none")
+        save_reminder(data["message"], due_dt, recurrence)
+
+        due_fmt = due_dt.strftime("%A, %B %d at %H:%M AST")
+        rec_txt = ""
+        if recurrence == "daily":
+            rec_txt = " (repeats daily)"
+        elif recurrence == "weekly":
+            rec_txt = " (repeats weekly)"
+
+        confirmation = f"⏰ Reminder set: *{data['message']}* — {due_fmt}{rec_txt}"
+        return f"{clean_text}\n{confirmation}".strip()
+    except Exception as e:
+        print(f"[REMINDER] extract error: {e}", flush=True)
+        return reply
+
+
 # ━━━ Commands ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def handle_command(msg: str, sender: str):
@@ -355,18 +491,23 @@ def handle_command(msg: str, sender: str):
             "• `!remember key: value` — Save a permanent fact\n"
             "• `!facts` — View all saved facts\n"
             "• `!forget [key]` — Remove a saved fact\n"
+            "• `!reminders` — View pending reminders\n"
             "• `!clear` — Reset conversation history\n"
             "• `!status` — System status\n"
-            "• `!help` — This message"
+            "• `!help` — This message\n\n"
+            "💡 Set reminders naturally:\n"
+            "\"Remind me tomorrow at 9am to call Albahiti\"\n"
+            "\"Remind me every Monday at 8am to review the team\""
         )
 
     if low == "!clear":
         clear_history(sender)
-        return "🗑️ Conversation history cleared. Profile facts kept."
+        return "🗑️ Conversation history cleared. Profile facts and reminders kept."
 
     if low == "!status":
-        profile = load_profile()
-        history = load_history(sender)
+        profile   = load_profile()
+        history   = load_history(sender)
+        reminders = list_reminders()
         now = datetime.now(AST).strftime("%Y-%m-%d %H:%M AST")
         return (
             f"🟢 *Safa7 Online*\n"
@@ -374,8 +515,16 @@ def handle_command(msg: str, sender: str):
             f"🤖 {MODEL}\n"
             f"💬 {len(history)} messages in history\n"
             f"📋 {len(profile)} saved facts\n"
+            f"🔔 {len(reminders)} pending reminders\n"
             f"📏 History limit: {MAX_HISTORY} messages"
         )
+
+    if low == "!reminders":
+        reminders = list_reminders()
+        if not reminders:
+            return "🔔 No pending reminders."
+        lines = [f"• [{r['id']}] {r['message']} — {r['due']} ({r['recurrence']})" for r in reminders]
+        return "🔔 *Pending Reminders*\n" + "\n".join(lines)
 
     if low == "!facts":
         profile = load_profile()
@@ -485,7 +634,7 @@ def process_message(incoming_msg: str, sender: str):
 
             history.append({"role": "user", "content": incoming_msg})
 
-            # 3. yfinance shortcut for oil/FX
+            # 3. yfinance shortcut for oil/FX only
             if is_yf_query(incoming_msg) and not is_saudi_query(incoming_msg):
                 market_data = get_yf_data(incoming_msg)
                 if market_data:
@@ -496,8 +645,12 @@ def process_message(incoming_msg: str, sender: str):
                     send_whatsapp(sender, market_data)
                     return
 
-            # 4. Claude
+            # 4. Claude with full history + profile
             reply = call_claude(history, profile)
+
+            # 5. Extract and save any reminders
+            reply = extract_and_save_reminder(reply)
+
             history.append({"role": "assistant", "content": reply})
             if len(history) > MAX_HISTORY:
                 history = history[-MAX_HISTORY:]
@@ -532,7 +685,8 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return {"status": "ok", "model": MODEL}, 200
+    reminders = list_reminders()
+    return {"status": "ok", "model": MODEL, "pending_reminders": len(reminders)}, 200
 
 
 if __name__ == "__main__":
