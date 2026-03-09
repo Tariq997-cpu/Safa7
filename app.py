@@ -503,7 +503,8 @@ def process_message(incoming_msg: str, sender: str):
                 print(f"[CLAUDE] {e.status_code}: {e}")
                 send_error(sender)
         except Exception as e:
-            print(f"[ERROR] {e}")
+            import traceback
+            print(f"[ERROR] {traceback.format_exc()}", flush=True)
             send_error(sender)
 
 
