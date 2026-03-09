@@ -9,6 +9,7 @@ import os
 import json
 import time
 import threading
+import traceback
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
@@ -72,7 +73,6 @@ _profile_lock       = threading.Lock()
 _sender_locks: dict = {}
 _sender_locks_meta  = threading.Lock()
 _executor           = ThreadPoolExecutor(max_workers=4)
-_gs_client          = None
 _gs_lock            = threading.Lock()
 
 
@@ -86,11 +86,9 @@ def _get_sender_lock(sender: str) -> threading.Lock:
 # ━━━ Google Sheets ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _gs():
-    global _gs_client
     with _gs_lock:
         creds = Credentials.from_service_account_info(_GS_CREDS, scopes=_GS_SCOPES)
-        _gs_client = gspread.authorize(creds)
-    return _gs_client
+        return gspread.authorize(creds)
 
 
 def _get_worksheet(tab: int):
@@ -124,10 +122,13 @@ def load_history(sender: str) -> list:
             records = _get_worksheet(0).get_all_records()
             for row in records:
                 if row.get("sender") == sender:
-                    return json.loads(row.get("messages", "[]"))
+                    data = json.loads(row.get("messages", "[]"))
+                    print(f"[HISTORY] Loaded {len(data)} messages for {sender}", flush=True)
+                    return data
+            print(f"[HISTORY] No history found for {sender}", flush=True)
             return []
         except Exception as e:
-            print(f"[HISTORY] load error: {e}")
+            print(f"[HISTORY] load error: {traceback.format_exc()}", flush=True)
             return []
 
 
@@ -139,10 +140,12 @@ def save_history(sender: str, messages: list):
             for i, row in enumerate(records):
                 if row.get("sender") == sender:
                     sheet.update_acell(f"B{i+2}", json.dumps(messages))
+                    print(f"[HISTORY] Saved {len(messages)} messages for {sender}", flush=True)
                     return
             sheet.append_row([sender, json.dumps(messages)])
+            print(f"[HISTORY] Created new row, saved {len(messages)} messages", flush=True)
         except Exception as e:
-            print(f"[HISTORY] save error: {e}")
+            print(f"[HISTORY] save error: {traceback.format_exc()}", flush=True)
 
 
 def clear_history(sender: str):
@@ -155,7 +158,7 @@ def clear_history(sender: str):
                     sheet.update_acell(f"B{i+2}", "[]")
                     return
         except Exception as e:
-            print(f"[HISTORY] clear error: {e}")
+            print(f"[HISTORY] clear error: {e}", flush=True)
 
 
 # ━━━ Profile / Facts (Tab 1) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -165,10 +168,10 @@ def load_profile() -> dict:
         try:
             records = _get_worksheet(1).get_all_records()
             result = {r["key"]: r["value"] for r in records if r.get("key")}
-            print(f"[PROFILE] Loaded {len(result)} facts: {list(result.keys())}")
+            print(f"[PROFILE] Loaded {len(result)} facts: {list(result.keys())}", flush=True)
             return result
         except Exception as e:
-            print(f"[PROFILE] load error: {e}")
+            print(f"[PROFILE] load error: {traceback.format_exc()}", flush=True)
             return {}
 
 
@@ -181,12 +184,12 @@ def save_fact(key: str, value: str):
             for i, row in enumerate(records):
                 if row.get("key", "").strip().lower() == key.strip().lower():
                     sheet.update(values=[[key, value, ts]], range_name=f"A{i+2}:C{i+2}")
-                    print(f"[PROFILE] Updated: {key}")
+                    print(f"[PROFILE] Updated: {key}", flush=True)
                     return
             sheet.append_row([key, value, ts])
-            print(f"[PROFILE] Saved new: {key}")
+            print(f"[PROFILE] Saved new: {key}", flush=True)
         except Exception as e:
-            print(f"[PROFILE] save error: {e}")
+            print(f"[PROFILE] save error: {traceback.format_exc()}", flush=True)
 
 
 def delete_fact(key: str) -> bool:
@@ -200,7 +203,7 @@ def delete_fact(key: str) -> bool:
                     return True
             return False
         except Exception as e:
-            print(f"[PROFILE] delete error: {e}")
+            print(f"[PROFILE] delete error: {e}", flush=True)
             return False
 
 
@@ -228,7 +231,7 @@ def get_yf_data(msg: str):
             elif price:
                 results.append(f"{keyword.upper()}: {price:,.2f}")
         except Exception as e:
-            print(f"[YFINANCE] {ticker}: {e}")
+            print(f"[YFINANCE] {ticker}: {e}", flush=True)
     if not results:
         return None
     ts = datetime.now(AST).strftime("%H:%M AST")
@@ -275,7 +278,7 @@ def send_whatsapp(to: str, text: str):
             if i > 0:
                 time.sleep(0.4)
         except Exception as e:
-            print(f"[TWILIO] chunk {i}: {e}")
+            print(f"[TWILIO] chunk {i}: {e}", flush=True)
 
 
 def send_error(to: str, msg: str = "Something went wrong. Please try again."):
@@ -321,7 +324,7 @@ COMMUNICATION RULES:
 - For market data: number first, source second, one line.
 - Never hedge. Never say "I recommend checking elsewhere."
 - No preamble. No "Based on..." or "Let me search..."
-- If a request is ambiguous or could be executed in multiple ways, ask ONE clarifying question before acting. Keep it short and specific.
+- If a request is ambiguous or could be executed in multiple ways, ask ONE clarifying question before acting.
 
 MARKET DATA:
 - Saudi market (TASI, stocks): use mubasher.info or saudiexchange.sa.
@@ -422,36 +425,42 @@ def clean_reply(reply: str) -> str:
 
 
 def call_claude(history: list, profile: dict) -> str:
-    system = build_system_prompt(profile)
-    tools = [{
-        "type": "web_search_20250305",
-        "name": "web_search",
-        "max_uses": 2,
-        "user_location": {
-            "type": "approximate",
-            "country": "SA",
-            "timezone": "Asia/Riyadh"
-        }
-    }]
+    try:
+        system = build_system_prompt(profile)
+        tools = [{
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 2,
+            "user_location": {
+                "type": "approximate",
+                "country": "SA",
+                "timezone": "Asia/Riyadh"
+            }
+        }]
 
-    response = claude.messages.create(
-        model=MODEL, max_tokens=1024,
-        system=system, tools=tools, messages=history
-    )
-
-    if response.stop_reason == "pause_turn":
         response = claude.messages.create(
             model=MODEL, max_tokens=1024,
-            system=system, tools=tools,
-            messages=history + [
-                {"role": "assistant", "content": response.content},
-                {"role": "user", "content": "Continue."}
-            ]
+            system=system, tools=tools, messages=history
         )
 
-    parts = [b.text for b in response.content if getattr(b, "type", "") == "text"]
-    reply = "\n".join(parts).strip() or "I couldn't generate a response. Try again."
-    return clean_reply(reply)
+        if response.stop_reason == "pause_turn":
+            response = claude.messages.create(
+                model=MODEL, max_tokens=1024,
+                system=system, tools=tools,
+                messages=history + [
+                    {"role": "assistant", "content": response.content},
+                    {"role": "user", "content": "Continue."}
+                ]
+            )
+
+        parts = [b.text for b in response.content if getattr(b, "type", "") == "text"]
+        reply = "\n".join(parts).strip() or "I couldn't generate a response. Try again."
+        print(f"[CLAUDE] Reply: {reply[:80]}", flush=True)
+        return clean_reply(reply)
+
+    except Exception as e:
+        print(f"[CLAUDE ERROR] {traceback.format_exc()}", flush=True)
+        raise
 
 
 # ━━━ Processing Pipeline ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -460,6 +469,8 @@ def process_message(incoming_msg: str, sender: str):
     lock = _get_sender_lock(sender)
     with lock:
         try:
+            print(f"[MSG] From {sender}: {incoming_msg[:60]}", flush=True)
+
             # 1. Commands
             if incoming_msg.startswith("!"):
                 result = handle_command(incoming_msg, sender)
@@ -467,10 +478,10 @@ def process_message(incoming_msg: str, sender: str):
                     send_whatsapp(sender, result)
                     return
 
-            # 2. Load history + profile UPFRONT — separate locks, no deadlock
+            # 2. Load history + profile upfront
             history = load_history(sender)
             profile = load_profile()
-            print(f"[PROCESS] Profile has {len(profile)} facts")
+            print(f"[PROCESS] History: {len(history)} msgs, Profile: {len(profile)} facts", flush=True)
 
             history.append({"role": "user", "content": incoming_msg})
 
@@ -485,7 +496,7 @@ def process_message(incoming_msg: str, sender: str):
                     send_whatsapp(sender, market_data)
                     return
 
-            # 4. Claude with full history + profile
+            # 4. Claude
             reply = call_claude(history, profile)
             history.append({"role": "assistant", "content": reply})
             if len(history) > MAX_HISTORY:
@@ -499,10 +510,9 @@ def process_message(incoming_msg: str, sender: str):
             if e.status_code == 529:
                 send_error(sender, "AI service overloaded. Try again shortly.")
             else:
-                print(f"[CLAUDE] {e.status_code}: {e}")
+                print(f"[CLAUDE] API error {e.status_code}: {e}", flush=True)
                 send_error(sender)
         except Exception as e:
-            import traceback
             print(f"[ERROR] {traceback.format_exc()}", flush=True)
             send_error(sender)
 
