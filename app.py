@@ -649,10 +649,12 @@ def health():
     return {"status": "ok", "model": MODEL}, 200
 
 
-# Start scheduler after app is defined so port is open first
-threading.Thread(target=reminder_scheduler, daemon=True).start()
+def start_scheduler():
+    """Called by gunicorn post_fork hook — runs inside the worker, after port is bound."""
+    threading.Thread(target=reminder_scheduler, daemon=True).start()
 
 
 if __name__ == "__main__":
+    start_scheduler()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
