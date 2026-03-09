@@ -88,9 +88,8 @@ def _get_sender_lock(sender: str) -> threading.Lock:
 def _gs():
     global _gs_client
     with _gs_lock:
-        if _gs_client is None:
-            creds = Credentials.from_service_account_info(_GS_CREDS, scopes=_GS_SCOPES)
-            _gs_client = gspread.authorize(creds)
+        creds = Credentials.from_service_account_info(_GS_CREDS, scopes=_GS_SCOPES)
+        _gs_client = gspread.authorize(creds)
     return _gs_client
 
 
