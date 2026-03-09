@@ -89,6 +89,7 @@ def _gs_client():
 
 
 def _open_sheet():
+    """Open the spreadsheet and return it (single auth call)."""
     return _gs_client().open_by_key(SHEET_ID)
 
 
@@ -114,34 +115,45 @@ def _init_sheets():
 _init_sheets()
 
 
-# ━━━ Batch Load ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━ Batch Load (one auth, one open, three reads) ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def load_all(sender: str):
-    """Returns (history, profile, pending_reminders) in one Sheets open."""
+    """
+    Returns (history: list, profile: dict, reminders: list)
+    All three tabs in a single spreadsheet open — minimises latency.
+    """
     try:
         with _gs_lock:
-            ss        = _open_sheet()
-            ws_hist   = ss.get_worksheet(0)
-            ws_prof   = ss.worksheet("Profile")
-            ws_rem    = ss.worksheet("Reminders")
+            ss       = _open_sheet()
+            ws_hist  = ss.get_worksheet(0)           # Sheet1
+            ws_prof  = ss.worksheet("Profile")
+            ws_rem   = ss.worksheet("Reminders")
+
             hist_rows = ws_hist.get_all_records()
             prof_rows = ws_prof.get_all_records()
             rem_rows  = ws_rem.get_all_records()
 
+        # history
         history = []
         for row in hist_rows:
             if row.get("sender") == sender:
                 history = json.loads(row.get("messages", "[]"))
                 break
 
+        # profile
         profile = {r["key"]: r["value"] for r in prof_rows if r.get("key")}
 
-        pending = [{**r, "_row": i + 2} for i, r in enumerate(rem_rows) if r.get("status") == "pending"]
+        # reminders (pending only)
+        now = datetime.now(AST)
+        pending = []
+        for i, r in enumerate(rem_rows):
+            if r.get("status") == "pending":
+                pending.append({**r, "_row": i + 2})
 
         print(f"[LOAD] history={len(history)} profile={len(profile)} reminders={len(pending)}", flush=True)
         return history, profile, pending
 
-    except Exception:
+    except Exception as e:
         print(f"[LOAD] error: {traceback.format_exc()}", flush=True)
         return [], {}, []
 
@@ -234,7 +246,7 @@ def mark_reminder_done(row_num: int, recurrence: str, due_str: str):
             if recurrence == "none":
                 sheet.update_acell(f"E{row_num}", "done")
             else:
-                due   = datetime.strptime(due_str, "%Y-%m-%d %H:%M").replace(tzinfo=AST)
+                due = datetime.strptime(due_str, "%Y-%m-%d %H:%M").replace(tzinfo=AST)
                 delta = timedelta(days=1) if recurrence == "daily" else timedelta(weeks=1)
                 sheet.update_acell(f"C{row_num}", (due + delta).strftime("%Y-%m-%d %H:%M"))
     except Exception as e:
@@ -271,9 +283,6 @@ def reminder_scheduler():
         except Exception as e:
             print(f"[SCHEDULER] Error: {e}", flush=True)
         time.sleep(60)
-
-
-threading.Thread(target=reminder_scheduler, daemon=True).start()
 
 
 # ━━━ Market Data ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -432,7 +441,8 @@ def extract_and_save_reminder(reply: str) -> str:
         return f"{clean_text}\n⏰ Reminder set: *{data['message']}* — {due_fmt}{rec_txt}".strip()
 
     except Exception as e:
-        print(f"[REMINDER] extract error: {e}", flush=True)
+        print(f"[REMINDER] extract error: {e} | raw: {reply[reply.find('REMINDER_JSON:'):reply.find('REMINDER_JSON:')+120]}", flush=True)
+        # Never crash — strip broken JSON, return clean text
         return reply.split("REMINDER_JSON:")[0].strip() or reply
 
 
@@ -518,7 +528,7 @@ def handle_command(msg: str, sender: str):
 # ━━━ Claude ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def clean_reply(reply: str) -> str:
-    noise  = [
+    noise = [
         "based on the search", "let me search", "i can see that",
         "i'm seeing", "i will search", "i should search",
         "search results show", "according to my search"
@@ -543,6 +553,7 @@ def call_claude(history: list, profile: dict) -> str:
         system=system, tools=tools, messages=history
     )
 
+    # Handle pause_turn (web search mid-stream)
     if response.stop_reason == "pause_turn":
         response = claude.messages.create(
             model=MODEL, max_tokens=MAX_TOKENS,
@@ -567,17 +578,20 @@ def process_message(incoming_msg: str, sender: str):
         try:
             print(f"[MSG] From {sender}: {incoming_msg[:80]}", flush=True)
 
+            # 1. Commands — fast path, no Sheets needed for most
             if incoming_msg.startswith("!"):
                 result = handle_command(incoming_msg, sender)
                 if result:
                     send_whatsapp(sender, result)
                     return
 
+            # 2. Single batch load — history + profile + reminders in one go
             history, profile, _ = load_all(sender)
             print(f"[PROCESS] history={len(history)} profile={len(profile)}", flush=True)
 
             history.append({"role": "user", "content": incoming_msg})
 
+            # 3. yfinance shortcut for oil/FX (not Saudi stocks)
             if is_yf_query(incoming_msg) and not is_saudi_query(incoming_msg):
                 market_data = get_yf_data(incoming_msg)
                 if market_data:
@@ -588,13 +602,19 @@ def process_message(incoming_msg: str, sender: str):
                     send_whatsapp(sender, market_data)
                     return
 
+            # 4. Claude
             reply = call_claude(history, profile)
+
+            # 5. Extract + save reminder BEFORE sending
             reply = extract_and_save_reminder(reply)
 
+            # 6. Update history
             history.append({"role": "assistant", "content": reply})
             if len(history) > MAX_HISTORY:
                 history = history[-MAX_HISTORY:]
             save_history(sender, history)
+
+            # 7. Send
             send_whatsapp(sender, reply)
 
         except anthropic.RateLimitError:
@@ -623,10 +643,14 @@ def webhook():
     return str(MessagingResponse()), 200
 
 
+@app.route("/", methods=["GET"])
 @app.route("/health", methods=["GET"])
 def health():
-    reminders = list_reminders_raw()
-    return {"status": "ok", "model": MODEL, "pending_reminders": len(reminders)}, 200
+    return {"status": "ok", "model": MODEL}, 200
+
+
+# Start scheduler after app is defined so port is open first
+threading.Thread(target=reminder_scheduler, daemon=True).start()
 
 
 if __name__ == "__main__":
