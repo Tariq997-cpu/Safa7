@@ -30,11 +30,8 @@ MAX_HISTORY = 30
 MAX_MSG_LEN = 1600
 AST = timezone(timedelta(hours=3))
 
-TICKERS = {
-    "tasi": "^TASI",
-    "aramco": "2222.SR",
-    "sabic": "2010.SR",
-    "stc": "7010.SR",
+# yfinance only for reliable tickers (oil, FX, global indices)
+YF_TICKERS = {
     "brent": "BZ=F",
     "wti": "CL=F",
     "oil": "BZ=F",
@@ -45,12 +42,21 @@ TICKERS = {
     "euro": "EURUSD=X",
     "gbp/usd": "GBPUSD=X",
     "pound": "GBPUSD=X",
-    "gold": "GC=F",
+    "s&p": "^GSPC",
+    "sp500": "^GSPC",
+    "nasdaq": "^IXIC",
 }
 
-MARKET_KEYWORDS = list(TICKERS.keys()) + [
-    "price", "close", "stock", "market", "rate", "index",
-    "trading", "value", "سعر", "سوق", "تاسي", "أرامكو"
+# Saudi market keywords — route to web search instead of yfinance
+SAUDI_KEYWORDS = [
+    "tasi", "tadawul", "aramco", "sabic", "stc", "alrajhi", "al rajhi",
+    "rajhi", "sabb", "riyad bank", "saudi stock", "تاسي", "تداول", "أرامكو",
+    "سوق", "سهم", "أسهم"
+]
+
+YF_KEYWORDS = list(YF_TICKERS.keys())
+MARKET_KEYWORDS = YF_KEYWORDS + SAUDI_KEYWORDS + [
+    "price", "close", "rate", "index", "market", "trading"
 ]
 
 
@@ -85,17 +91,14 @@ def _get_sender_lock(sender):
         return _sender_locks[sender]
 
 
-# ━━━ Market Data ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━ Market Data (yfinance — oil & FX only) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def get_market_data(msg):
-    """Detect market tickers in message and fetch live data via yfinance."""
+def get_yf_data(msg):
     msg_lower = msg.lower()
     matched = {}
-
-    for keyword, ticker in TICKERS.items():
+    for keyword, ticker in YF_TICKERS.items():
         if keyword in msg_lower and ticker not in matched.values():
             matched[keyword] = ticker
-
     if not matched:
         return None
 
@@ -106,14 +109,11 @@ def get_market_data(msg):
             info = t.fast_info
             price = info.last_price
             prev_close = info.previous_close
-
             if price and prev_close:
                 change = price - prev_close
                 pct = (change / prev_close) * 100
                 direction = "▲" if change >= 0 else "▼"
-                results.append(
-                    f"{keyword.upper()}: {price:,.2f} {direction} {abs(pct):.2f}%"
-                )
+                results.append(f"{keyword.upper()}: {price:,.2f} {direction} {abs(pct):.2f}%")
             elif price:
                 results.append(f"{keyword.upper()}: {price:,.2f}")
         except Exception as e:
@@ -126,12 +126,17 @@ def get_market_data(msg):
     return "\n".join(results) + f"\n_{ts}_"
 
 
-def is_market_query(msg):
+def is_saudi_query(msg):
     msg_lower = msg.lower()
-    return any(kw in msg_lower for kw in MARKET_KEYWORDS)
+    return any(kw in msg_lower for kw in SAUDI_KEYWORDS)
 
 
-# ━━━ Google Sheets Layer ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def is_yf_query(msg):
+    msg_lower = msg.lower()
+    return any(kw in msg_lower for kw in YF_KEYWORDS)
+
+
+# ━━━ Google Sheets ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _gs():
     global _gs_client
@@ -161,8 +166,6 @@ def _init_sheets():
 
 _init_sheets()
 
-
-# ━━━ History ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def load_history(sender):
     with _sheet_lock:
@@ -203,8 +206,6 @@ def clear_history(sender):
         except Exception as e:
             print(f"[SHEETS] clear_history: {e}")
 
-
-# ━━━ Profile ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def load_profile():
     with _sheet_lock:
@@ -309,20 +310,27 @@ def validate_twilio(f):
 
 # ━━━ System Prompt ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-SYSTEM_PROMPT = """You are Safa7. You give ONE sentence answers to market data questions. Number first. Source second. Nothing else. No explanations. No caveats. No "however". No "I notice". No "Based on". No "Let me". Just the fact.
+SYSTEM_PROMPT = """You are Safa7. Sharp, direct, zero fluff. Built for a senior tourism/hospitality investment and finance professional in Saudi Arabia.
 
-RULES — no exceptions:
-1. Market data will be injected directly into the conversation when available — trust it completely, it comes from yfinance (live feed). Just present it cleanly.
-2. For non-market questions: be concise, sharp, no fluff.
-3. Maximum 2 sentences for any market query.
-4. Match user language (Arabic/English/mixed).
-5. No preamble. No hedging. No narrating.
-6. Analysis: take a position, quantify risks, no hedging.
+RULES:
+1. Market data: number first, source second, one line. Done.
+2. Pick the best number available. State it. No debate.
+3. Never say "I cannot confirm" or "you may need to check" — you ARE the check.
+4. Max 2 sentences for market queries. More only if asked.
+5. Match user language (Arabic/English/mixed).
+6. No preamble. No hedging. No narrating your search process.
+7. For Saudi market data (TASI, Saudi stocks): search mubasher.info or saudiexchange.sa first — these are the authoritative sources.
+
+CORRECT response format:
+"TASI closed at 11,007.19 (+2.14%) on March 8 — Mubasher."
+
+WRONG (never do this):
+"Based on search results... However... Let me search... I can see..."
 
 <web_search>
-Use search ONLY for: news, earnings, IPOs, regulations, geopolitical events.
-Do NOT use search for prices or rates — those come from live data feed.
-Pick ONE best source. State the fact. Stop.
+Use for: Saudi market data, news, earnings, IPOs, regulations, events.
+For oil/FX: data is injected directly — just present it cleanly.
+Source priority for Saudi data: saudiexchange.sa > mubasher.info > argaam.com > investing.com
 </web_search>
 
 <user_context>
@@ -356,7 +364,6 @@ def handle_command(msg, sender):
             "• `!status` — System status\n"
             "• `!help` — This message"
         )
-
     if low == "!clear":
         clear_history(sender)
         return "🗑️ History cleared."
@@ -466,12 +473,11 @@ def process_message(incoming_msg, sender):
                     send_whatsapp(sender, result)
                     return
 
-            # Try live market data first
-            if is_market_query(incoming_msg):
-                market_data = get_market_data(incoming_msg)
+            # yfinance for oil & FX (fast, reliable)
+            if is_yf_query(incoming_msg) and not is_saudi_query(incoming_msg):
+                market_data = get_yf_data(incoming_msg)
                 if market_data:
                     send_whatsapp(sender, market_data)
-                    # Still save to history for context
                     history = load_history(sender)
                     history.append({"role": "user", "content": incoming_msg})
                     history.append({"role": "assistant", "content": market_data})
@@ -480,7 +486,7 @@ def process_message(incoming_msg, sender):
                     save_history(sender, history)
                     return
 
-            # Fall through to Claude for everything else
+            # Everything else (including Saudi market) → Claude with web search
             history = load_history(sender)
             history.append({"role": "user", "content": incoming_msg})
             reply = call_claude(history)
@@ -510,10 +516,8 @@ def process_message(incoming_msg, sender):
 def webhook():
     body = request.values.get("Body", "").strip()
     sender = request.values.get("From", "")
-
     if not body or not sender:
         return str(MessagingResponse()), 200
-
     _executor.submit(process_message, body, sender)
     return str(MessagingResponse()), 200
 
