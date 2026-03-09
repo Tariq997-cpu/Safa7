@@ -389,7 +389,7 @@ MEMORY: Profile facts = long-term memory. History = short-term. If it's in eithe
 REMINDERS — CRITICAL RULES:
 When asked to set a reminder, respond with EXACTLY this format and nothing else:
 Got it. Reminding you to [task] on [date] at [time].
-REMINDER_JSON: {"message": "task description", "due": "YYYY-MM-DD HH:MM", "recurrence": "none"}
+REMINDER_JSON: {{"message": "task description", "due": "YYYY-MM-DD HH:MM", "recurrence": "none"}}
 
 - Recurrence: "none", "daily", or "weekly"
 - Current time is injected below — use it to resolve "today", "tomorrow", "next week"
