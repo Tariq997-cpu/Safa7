@@ -1,6 +1,8 @@
 """
 Safa7 — WhatsApp AI Assistant
 Flask + Twilio + Anthropic Claude + Google Sheets + yfinance
+
+Priority: Task management, team tracking, memory recall.
 """
 
 import os
@@ -26,11 +28,10 @@ import anthropic
 app = Flask(__name__)
 
 MODEL = "claude-sonnet-4-20250514"
-MAX_HISTORY = 30
+MAX_HISTORY = 50
 MAX_MSG_LEN = 1600
 AST = timezone(timedelta(hours=3))
 
-# yfinance tickers — oil & FX only
 YF_TICKERS = {
     "brent": "BZ=F",
     "wti": "CL=F",
@@ -40,12 +41,8 @@ YF_TICKERS = {
     "nasdaq": "^IXIC",
 }
 
-# These trigger yfinance — must be specific enough to not false-trigger
-YF_TRIGGERS = [
-    "brent", "wti", "eur/usd", "gbp/usd", "s&p 500", "nasdaq",
-]
+YF_TRIGGERS = list(YF_TICKERS.keys())
 
-# These trigger web search for Saudi market data
 SAUDI_TRIGGERS = [
     "tasi", "tadawul", "aramco", "sabic", "stc", "alrajhi", "al rajhi",
     "riyad bank", "alinma", "saudi stock", "saudi market", "saudi exchange",
@@ -57,91 +54,47 @@ SAUDI_TRIGGERS = [
 
 claude = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
-TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_SID    = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_NUMBER = os.environ.get("TWILIO_NUMBER", "whatsapp:+14155238886")
-twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
+twilio_client    = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
 twilio_validator = RequestValidator(TWILIO_TOKEN)
 
-_GS_CREDS = json.loads(os.environ.get("GOOGLE_CREDENTIALS", "{}"))
+_GS_CREDS  = json.loads(os.environ.get("GOOGLE_CREDENTIALS", "{}"))
 _GS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+SHEET_ID   = os.environ.get("GOOGLE_SHEET_ID")
 
 
 # ━━━ Thread Safety ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-_sheet_lock = threading.Lock()
-_sender_locks = {}
-_sender_locks_meta = threading.Lock()
-_executor = ThreadPoolExecutor(max_workers=3)
-_gs_client = None
+_history_lock       = threading.Lock()
+_profile_lock       = threading.Lock()
+_sender_locks: dict = {}
+_sender_locks_meta  = threading.Lock()
+_executor           = ThreadPoolExecutor(max_workers=4)
+_gs_client          = None
+_gs_lock            = threading.Lock()
 
 
-def _get_sender_lock(sender):
+def _get_sender_lock(sender: str) -> threading.Lock:
     with _sender_locks_meta:
         if sender not in _sender_locks:
             _sender_locks[sender] = threading.Lock()
         return _sender_locks[sender]
 
 
-# ━━━ Market Data ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def get_yf_data(msg):
-    msg_lower = msg.lower()
-    matched = {}
-    for keyword, ticker in YF_TICKERS.items():
-        if keyword in msg_lower and ticker not in matched.values():
-            matched[keyword] = ticker
-    if not matched:
-        return None
-
-    results = []
-    for keyword, ticker in matched.items():
-        try:
-            t = yf.Ticker(ticker)
-            info = t.fast_info
-            price = info.last_price
-            prev_close = info.previous_close
-            if price and prev_close:
-                change = price - prev_close
-                pct = (change / prev_close) * 100
-                direction = "▲" if change >= 0 else "▼"
-                results.append(f"{keyword.upper()}: {price:,.2f} {direction} {abs(pct):.2f}%")
-            elif price:
-                results.append(f"{keyword.upper()}: {price:,.2f}")
-        except Exception as e:
-            print(f"[YFINANCE] {ticker}: {e}")
-
-    if not results:
-        return None
-
-    ts = datetime.now(AST).strftime("%H:%M AST")
-    return "\n".join(results) + f"\n_{ts}_"
-
-
-def is_yf_query(msg):
-    """Only trigger yfinance for very specific financial terms."""
-    msg_lower = msg.lower()
-    return any(trigger in msg_lower for trigger in YF_TRIGGERS)
-
-
-def is_saudi_query(msg):
-    """Trigger web search for Saudi market specific terms."""
-    msg_lower = msg.lower()
-    return any(trigger in msg_lower for trigger in SAUDI_TRIGGERS)
-
-
 # ━━━ Google Sheets ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _gs():
     global _gs_client
-    if _gs_client is None:
-        creds = Credentials.from_service_account_info(_GS_CREDS, scopes=_GS_SCOPES)
-        _gs_client = gspread.authorize(creds)
+    with _gs_lock:
+        if _gs_client is None:
+            creds = Credentials.from_service_account_info(_GS_CREDS, scopes=_GS_SCOPES)
+            _gs_client = gspread.authorize(creds)
     return _gs_client
 
 
-def _sheet(tab=0):
+def _get_worksheet(tab: int):
     return _gs().open_by_key(SHEET_ID).get_worksheet(tab)
 
 
@@ -149,12 +102,14 @@ def _init_sheets():
     if not _GS_CREDS or not SHEET_ID:
         return
     try:
-        with _sheet_lock:
-            spreadsheet = _gs().open_by_key(SHEET_ID)
-            titles = [ws.title for ws in spreadsheet.worksheets()]
-            if "Profile" not in titles:
-                ws = spreadsheet.add_worksheet(title="Profile", rows=100, cols=3)
-                ws.update(values=[["key", "value", "updated"]], range_name="A1:C1")
+        spreadsheet = _gs().open_by_key(SHEET_ID)
+        titles = [ws.title for ws in spreadsheet.worksheets()]
+        if "Profile" not in titles:
+            ws = spreadsheet.add_worksheet(title="Profile", rows=200, cols=3)
+            ws.update(values=[["key", "value", "updated"]], range_name="A1:C1")
+            print("[INIT] Profile tab created")
+        else:
+            print("[INIT] Profile tab OK")
     except Exception as e:
         print(f"[INIT] {e}")
 
@@ -162,23 +117,25 @@ def _init_sheets():
 _init_sheets()
 
 
-def load_history(sender):
-    with _sheet_lock:
+# ━━━ History (Tab 0) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def load_history(sender: str) -> list:
+    with _history_lock:
         try:
-            records = _sheet(0).get_all_records()
+            records = _get_worksheet(0).get_all_records()
             for row in records:
                 if row.get("sender") == sender:
                     return json.loads(row.get("messages", "[]"))
             return []
         except Exception as e:
-            print(f"[SHEETS] load_history: {e}")
+            print(f"[HISTORY] load error: {e}")
             return []
 
 
-def save_history(sender, messages):
-    with _sheet_lock:
+def save_history(sender: str, messages: list):
+    with _history_lock:
         try:
-            sheet = _sheet(0)
+            sheet = _get_worksheet(0)
             records = sheet.get_all_records()
             for i, row in enumerate(records):
                 if row.get("sender") == sender:
@@ -186,51 +143,57 @@ def save_history(sender, messages):
                     return
             sheet.append_row([sender, json.dumps(messages)])
         except Exception as e:
-            print(f"[SHEETS] save_history: {e}")
+            print(f"[HISTORY] save error: {e}")
 
 
-def clear_history(sender):
-    with _sheet_lock:
+def clear_history(sender: str):
+    with _history_lock:
         try:
-            sheet = _sheet(0)
+            sheet = _get_worksheet(0)
             records = sheet.get_all_records()
             for i, row in enumerate(records):
                 if row.get("sender") == sender:
                     sheet.update_acell(f"B{i+2}", "[]")
                     return
         except Exception as e:
-            print(f"[SHEETS] clear_history: {e}")
+            print(f"[HISTORY] clear error: {e}")
 
 
-def load_profile():
-    with _sheet_lock:
+# ━━━ Profile / Facts (Tab 1) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def load_profile() -> dict:
+    with _profile_lock:
         try:
-            records = _sheet(1).get_all_records()
-            return {r["key"]: r["value"] for r in records if r.get("key")}
+            records = _get_worksheet(1).get_all_records()
+            result = {r["key"]: r["value"] for r in records if r.get("key")}
+            print(f"[PROFILE] Loaded {len(result)} facts: {list(result.keys())}")
+            return result
         except Exception as e:
-            print(f"[SHEETS] load_profile: {e}")
+            print(f"[PROFILE] load error: {e}")
             return {}
 
 
-def save_fact(key, value):
-    with _sheet_lock:
+def save_fact(key: str, value: str):
+    with _profile_lock:
         try:
-            sheet = _sheet(1)
+            sheet = _get_worksheet(1)
             records = sheet.get_all_records()
             ts = datetime.now(AST).strftime("%Y-%m-%d %H:%M")
             for i, row in enumerate(records):
                 if row.get("key", "").strip().lower() == key.strip().lower():
                     sheet.update(values=[[key, value, ts]], range_name=f"A{i+2}:C{i+2}")
+                    print(f"[PROFILE] Updated: {key}")
                     return
             sheet.append_row([key, value, ts])
+            print(f"[PROFILE] Saved new: {key}")
         except Exception as e:
-            print(f"[SHEETS] save_fact: {e}")
+            print(f"[PROFILE] save error: {e}")
 
 
-def delete_fact(key):
-    with _sheet_lock:
+def delete_fact(key: str) -> bool:
+    with _profile_lock:
         try:
-            sheet = _sheet(1)
+            sheet = _get_worksheet(1)
             records = sheet.get_all_records()
             for i, row in enumerate(records):
                 if row.get("key", "").strip().lower() == key.strip().lower():
@@ -238,13 +201,54 @@ def delete_fact(key):
                     return True
             return False
         except Exception as e:
-            print(f"[SHEETS] delete_fact: {e}")
+            print(f"[PROFILE] delete error: {e}")
             return False
+
+
+# ━━━ Market Data ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def get_yf_data(msg: str):
+    msg_lower = msg.lower()
+    matched = {}
+    for keyword, ticker in YF_TICKERS.items():
+        if keyword in msg_lower and ticker not in matched.values():
+            matched[keyword] = ticker
+    if not matched:
+        return None
+    results = []
+    for keyword, ticker in matched.items():
+        try:
+            info  = yf.Ticker(ticker).fast_info
+            price = info.last_price
+            prev  = info.previous_close
+            if price and prev:
+                chg   = price - prev
+                pct   = (chg / prev) * 100
+                arrow = "▲" if chg >= 0 else "▼"
+                results.append(f"{keyword.upper()}: {price:,.2f} {arrow} {abs(pct):.2f}%")
+            elif price:
+                results.append(f"{keyword.upper()}: {price:,.2f}")
+        except Exception as e:
+            print(f"[YFINANCE] {ticker}: {e}")
+    if not results:
+        return None
+    ts = datetime.now(AST).strftime("%H:%M AST")
+    return "\n".join(results) + f"\n_{ts}_"
+
+
+def is_yf_query(msg: str) -> bool:
+    ml = msg.lower()
+    return any(t in ml for t in YF_TRIGGERS)
+
+
+def is_saudi_query(msg: str) -> bool:
+    ml = msg.lower()
+    return any(t in ml for t in SAUDI_TRIGGERS)
 
 
 # ━━━ Messaging ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def split_message(text, limit=MAX_MSG_LEN):
+def split_message(text: str, limit: int = MAX_MSG_LEN) -> list:
     if len(text) <= limit:
         return [text]
     chunks = []
@@ -252,34 +256,30 @@ def split_message(text, limit=MAX_MSG_LEN):
         if len(text) <= limit:
             chunks.append(text)
             break
-        pos = text.rfind("\n\n", 0, limit)
-        if pos < 1:
-            pos = text.rfind(". ", 0, limit)
+        for sep in ["\n\n", ". ", "\n", " "]:
+            pos = text.rfind(sep, 0, limit)
             if pos > 0:
-                pos += 1
-        if pos < 1:
-            pos = text.rfind("\n", 0, limit)
-        if pos < 1:
-            pos = text.rfind(" ", 0, limit)
-        if pos < 1:
+                if sep == ". ":
+                    pos += 1
+                break
+        else:
             pos = limit
         chunks.append(text[:pos].strip())
         text = text[pos:].strip()
     return [c for c in chunks if c]
 
 
-def send_whatsapp(to, text):
-    chunks = split_message(text)
-    for i, chunk in enumerate(chunks):
+def send_whatsapp(to: str, text: str):
+    for i, chunk in enumerate(split_message(text)):
         try:
             twilio_client.messages.create(body=chunk, from_=TWILIO_NUMBER, to=to)
-            if len(chunks) > 1 and i < len(chunks) - 1:
-                time.sleep(0.3)
+            if i > 0:
+                time.sleep(0.4)
         except Exception as e:
-            print(f"[TWILIO] {e}")
+            print(f"[TWILIO] chunk {i}: {e}")
 
 
-def send_error(to, msg="Something went wrong. Please try again."):
+def send_error(to: str, msg: str = "Something went wrong. Please try again."):
     try:
         twilio_client.messages.create(body=f"⚠️ {msg}", from_=TWILIO_NUMBER, to=to)
     except Exception:
@@ -305,80 +305,81 @@ def validate_twilio(f):
 
 # ━━━ System Prompt ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-SYSTEM_PROMPT = """You are Safa7. Sharp, direct, zero fluff. Built for a senior finance professional in Saudi Arabia.
+SYSTEM_PROMPT = """You are Safa7 — a sharp, discreet personal assistant for a senior finance professional in Saudi Arabia.
 
-RULES:
-1. You have full conversation memory — always use it. Never say "I don't have context" if it was discussed earlier in this conversation.
-2. Market data: number first, source second, one line. Done.
-3. Never say "I cannot confirm" or "you may need to check" — you ARE the check.
-4. Max 2 sentences for market queries. More only if asked.
-5. Match user language (Arabic/English/mixed).
-6. No preamble. No hedging. No narrating your search process.
-7. For tasks, reminders, notes — confirm clearly and recall accurately when asked.
-8. For Saudi market data: search mubasher.info or saudiexchange.sa first.
+YOUR PRIMARY JOB: Help manage tasks, team, priorities, meetings, and follow-ups. You are a trusted chief of staff.
 
-CORRECT market response: "TASI closed at 11,007.19 (+2.14%) on March 8 — Mubasher."
-WRONG (never): "Based on search results... However... Let me search... I don't have context..."
+MEMORY RULES:
+- Your profile facts below are your long-term memory. Trust them completely.
+- Conversation history is your short-term memory. Use it fully.
+- If something is in your profile facts OR conversation history — you know it. Never say "I don't have that information."
+- When told about tasks, meetings, team updates — confirm clearly that you have it.
 
-<web_search>
-Use for: Saudi market data, news, earnings, IPOs, regulations, events.
-For oil/FX: data injected directly — present it cleanly.
-Source priority for Saudi data: saudiexchange.sa > mubasher.info > argaam.com > investing.com
-</web_search>
+COMMUNICATION RULES:
+- Match user language (Arabic/English/mixed).
+- Lead with the answer. Be concise.
+- For tasks/team: organized, clear, proactive.
+- For market data: number first, source second, one line.
+- Never hedge. Never say "I recommend checking elsewhere."
+- No preamble. No "Based on..." or "Let me search..."
+- If a request is ambiguous or could be executed in multiple ways, ask ONE clarifying question before acting. Keep it short and specific.
 
-<user_context>
+MARKET DATA:
+- Saudi market (TASI, stocks): use mubasher.info or saudiexchange.sa.
+- Oil/FX: injected directly — present cleanly.
+- Format: "TASI closed at 11,007.19 (+2.14%) — Mubasher."
+
+YOUR LONG-TERM MEMORY:
 {profile_facts}
-</user_context>
 
-<current_time>{current_time}</current_time>"""
+Current time: {current_time}"""
 
 
-def _build_system_prompt():
-    facts = load_profile()
-    pf = "\n".join(f"- {k}: {v}" for k, v in facts.items()) if facts \
-        else "No profile facts saved yet."
+def build_system_prompt(profile: dict) -> str:
+    pf  = "\n".join(f"- {k}: {v}" for k, v in profile.items()) if profile else "No facts saved yet."
     now = datetime.now(AST).strftime("%A, %B %d, %Y at %H:%M AST")
     return SYSTEM_PROMPT.format(profile_facts=pf, current_time=now)
 
 
 # ━━━ Commands ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def handle_command(msg, sender):
+def handle_command(msg: str, sender: str):
     raw = msg.strip()
     low = raw.lower()
 
     if low == "!help":
         return (
             "📖 *Safa7 Commands*\n\n"
-            "• `!remember key: value` — Save a persistent fact\n"
+            "• `!remember key: value` — Save a permanent fact\n"
             "• `!facts` — View all saved facts\n"
             "• `!forget [key]` — Remove a saved fact\n"
             "• `!clear` — Reset conversation history\n"
             "• `!status` — System status\n"
             "• `!help` — This message"
         )
+
     if low == "!clear":
         clear_history(sender)
-        return "🗑️ History cleared."
+        return "🗑️ Conversation history cleared. Profile facts kept."
 
     if low == "!status":
-        facts = load_profile()
-        hist = load_history(sender)
+        profile = load_profile()
+        history = load_history(sender)
         now = datetime.now(AST).strftime("%Y-%m-%d %H:%M AST")
         return (
             f"🟢 *Safa7 Online*\n"
             f"⏰ {now}\n"
             f"🤖 {MODEL}\n"
-            f"💬 {len(hist)} messages in history\n"
-            f"📋 {len(facts)} saved facts\n"
+            f"💬 {len(history)} messages in history\n"
+            f"📋 {len(profile)} saved facts\n"
             f"📏 History limit: {MAX_HISTORY} messages"
         )
 
     if low == "!facts":
-        facts = load_profile()
-        if not facts:
+        profile = load_profile()
+        if not profile:
             return "📋 No saved facts yet. Use `!remember key: value` to save one."
-        lines = [f"• *{k}*: {v}" for k, v in facts.items()]
+        lines = [f"• *{k}*: {v}" for k, v in profile.items()]
         return "📋 *Saved Facts*\n" + "\n".join(lines)
 
     if low.startswith("!remember "):
@@ -394,7 +395,7 @@ def handle_command(msg, sender):
             key = fact[:60].strip()
             value = fact
         save_fact(key, value)
-        return f"✅ Saved: *{key}*"
+        return f"✅ Saved to permanent memory: *{key}*"
 
     if low.startswith("!forget "):
         key = raw[8:].strip()
@@ -402,27 +403,27 @@ def handle_command(msg, sender):
             return "Usage: `!forget [key]`"
         if delete_fact(key):
             return f"🗑️ Removed: *{key}*"
-        return f"❌ No fact found matching: *{key}*"
+        return f"❌ No fact found matching: *{key}*. Use `!facts` to see what's saved."
 
     return None
 
 
 # ━━━ Claude ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def clean_reply(reply):
+def clean_reply(reply: str) -> str:
     lines = reply.split("\n")
     noise = [
-        "search result", "let me search", "i can see", "i notice",
-        "i need to", "based on the search", "conflicting",
-        "i'm seeing", "i will search", "i should search"
+        "based on the search", "let me search", "i can see that",
+        "i'm seeing", "i will search", "i should search",
+        "search results show", "according to my search"
     ]
     clean = [l for l in lines if not any(p in l.lower() for p in noise)]
     result = "\n".join(clean).strip()
     return result if result else reply.strip()
 
 
-def call_claude(history):
-    system = _build_system_prompt()
+def call_claude(history: list, profile: dict) -> str:
+    system = build_system_prompt(profile)
     tools = [{
         "type": "web_search_20250305",
         "name": "web_search",
@@ -435,13 +436,14 @@ def call_claude(history):
     }]
 
     response = claude.messages.create(
-        model=MODEL, max_tokens=1024, system=system,
-        tools=tools, messages=history
+        model=MODEL, max_tokens=1024,
+        system=system, tools=tools, messages=history
     )
 
     if response.stop_reason == "pause_turn":
         response = claude.messages.create(
-            model=MODEL, max_tokens=1024, system=system, tools=tools,
+            model=MODEL, max_tokens=1024,
+            system=system, tools=tools,
             messages=history + [
                 {"role": "assistant", "content": response.content},
                 {"role": "user", "content": "Continue."}
@@ -455,22 +457,25 @@ def call_claude(history):
 
 # ━━━ Processing Pipeline ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def process_message(incoming_msg, sender):
+def process_message(incoming_msg: str, sender: str):
     lock = _get_sender_lock(sender)
     with lock:
         try:
-            # Commands
+            # 1. Commands
             if incoming_msg.startswith("!"):
                 result = handle_command(incoming_msg, sender)
                 if result:
                     send_whatsapp(sender, result)
                     return
 
-            # Load history first — always
+            # 2. Load history + profile UPFRONT — separate locks, no deadlock
             history = load_history(sender)
+            profile = load_profile()
+            print(f"[PROCESS] Profile has {len(profile)} facts")
+
             history.append({"role": "user", "content": incoming_msg})
 
-            # yfinance shortcut for specific oil/FX terms — still saves to history
+            # 3. yfinance shortcut for oil/FX
             if is_yf_query(incoming_msg) and not is_saudi_query(incoming_msg):
                 market_data = get_yf_data(incoming_msg)
                 if market_data:
@@ -481,8 +486,8 @@ def process_message(incoming_msg, sender):
                     send_whatsapp(sender, market_data)
                     return
 
-            # Everything else → Claude with full history and web search
-            reply = call_claude(history)
+            # 4. Claude with full history + profile
+            reply = call_claude(history, profile)
             history.append({"role": "assistant", "content": reply})
             if len(history) > MAX_HISTORY:
                 history = history[-MAX_HISTORY:]
@@ -507,7 +512,7 @@ def process_message(incoming_msg, sender):
 @app.route("/webhook", methods=["POST"])
 @validate_twilio
 def webhook():
-    body = request.values.get("Body", "").strip()
+    body   = request.values.get("Body", "").strip()
     sender = request.values.get("From", "")
     if not body or not sender:
         return str(MessagingResponse()), 200
