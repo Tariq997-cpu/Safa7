@@ -2,6 +2,7 @@ flask
 twilio
 anthropic
 gunicorn
+gevent
 gspread
 google-auth
 yfinance
