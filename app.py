@@ -30,33 +30,26 @@ MAX_HISTORY = 30
 MAX_MSG_LEN = 1600
 AST = timezone(timedelta(hours=3))
 
-# yfinance only for reliable tickers (oil, FX, global indices)
+# yfinance tickers — oil & FX only
 YF_TICKERS = {
     "brent": "BZ=F",
     "wti": "CL=F",
-    "oil": "BZ=F",
-    "usd/sar": "SAR=X",
-    "sar": "SAR=X",
-    "dollar": "SAR=X",
     "eur/usd": "EURUSD=X",
-    "euro": "EURUSD=X",
     "gbp/usd": "GBPUSD=X",
-    "pound": "GBPUSD=X",
-    "s&p": "^GSPC",
-    "sp500": "^GSPC",
+    "s&p 500": "^GSPC",
     "nasdaq": "^IXIC",
 }
 
-# Saudi market keywords — route to web search instead of yfinance
-SAUDI_KEYWORDS = [
-    "tasi", "tadawul", "aramco", "sabic", "stc", "alrajhi", "al rajhi",
-    "rajhi", "sabb", "riyad bank", "saudi stock", "تاسي", "تداول", "أرامكو",
-    "سوق", "سهم", "أسهم"
+# These trigger yfinance — must be specific enough to not false-trigger
+YF_TRIGGERS = [
+    "brent", "wti", "eur/usd", "gbp/usd", "s&p 500", "nasdaq",
 ]
 
-YF_KEYWORDS = list(YF_TICKERS.keys())
-MARKET_KEYWORDS = YF_KEYWORDS + SAUDI_KEYWORDS + [
-    "price", "close", "rate", "index", "market", "trading"
+# These trigger web search for Saudi market data
+SAUDI_TRIGGERS = [
+    "tasi", "tadawul", "aramco", "sabic", "stc", "alrajhi", "al rajhi",
+    "riyad bank", "alinma", "saudi stock", "saudi market", "saudi exchange",
+    "usd/sar", "usd sar", "dollar sar", "ريال", "تاسي", "تداول", "أرامكو",
 ]
 
 
@@ -91,7 +84,7 @@ def _get_sender_lock(sender):
         return _sender_locks[sender]
 
 
-# ━━━ Market Data (yfinance — oil & FX only) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━ Market Data ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def get_yf_data(msg):
     msg_lower = msg.lower()
@@ -126,14 +119,16 @@ def get_yf_data(msg):
     return "\n".join(results) + f"\n_{ts}_"
 
 
-def is_saudi_query(msg):
-    msg_lower = msg.lower()
-    return any(kw in msg_lower for kw in SAUDI_KEYWORDS)
-
-
 def is_yf_query(msg):
+    """Only trigger yfinance for very specific financial terms."""
     msg_lower = msg.lower()
-    return any(kw in msg_lower for kw in YF_KEYWORDS)
+    return any(trigger in msg_lower for trigger in YF_TRIGGERS)
+
+
+def is_saudi_query(msg):
+    """Trigger web search for Saudi market specific terms."""
+    msg_lower = msg.lower()
+    return any(trigger in msg_lower for trigger in SAUDI_TRIGGERS)
 
 
 # ━━━ Google Sheets ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -310,26 +305,24 @@ def validate_twilio(f):
 
 # ━━━ System Prompt ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-SYSTEM_PROMPT = """You are Safa7. Sharp, direct, zero fluff. Built for a senior tourism/hospitality investment and finance professional in Saudi Arabia.
+SYSTEM_PROMPT = """You are Safa7. Sharp, direct, zero fluff. Built for a senior finance professional in Saudi Arabia.
 
 RULES:
-1. Market data: number first, source second, one line. Done.
-2. Pick the best number available. State it. No debate.
+1. You have full conversation memory — always use it. Never say "I don't have context" if it was discussed earlier in this conversation.
+2. Market data: number first, source second, one line. Done.
 3. Never say "I cannot confirm" or "you may need to check" — you ARE the check.
 4. Max 2 sentences for market queries. More only if asked.
 5. Match user language (Arabic/English/mixed).
 6. No preamble. No hedging. No narrating your search process.
-7. For Saudi market data (TASI, Saudi stocks): search mubasher.info or saudiexchange.sa first — these are the authoritative sources.
+7. For tasks, reminders, notes — confirm clearly and recall accurately when asked.
+8. For Saudi market data: search mubasher.info or saudiexchange.sa first.
 
-CORRECT response format:
-"TASI closed at 11,007.19 (+2.14%) on March 8 — Mubasher."
-
-WRONG (never do this):
-"Based on search results... However... Let me search... I can see..."
+CORRECT market response: "TASI closed at 11,007.19 (+2.14%) on March 8 — Mubasher."
+WRONG (never): "Based on search results... However... Let me search... I don't have context..."
 
 <web_search>
 Use for: Saudi market data, news, earnings, IPOs, regulations, events.
-For oil/FX: data is injected directly — just present it cleanly.
+For oil/FX: data injected directly — present it cleanly.
 Source priority for Saudi data: saudiexchange.sa > mubasher.info > argaam.com > investing.com
 </web_search>
 
@@ -420,8 +413,8 @@ def clean_reply(reply):
     lines = reply.split("\n")
     noise = [
         "search result", "let me search", "i can see", "i notice",
-        "i need to", "based on", "however,", "conflicting", "let me",
-        "i'm seeing", "i found", "i will search", "i should search"
+        "i need to", "based on the search", "conflicting",
+        "i'm seeing", "i will search", "i should search"
     ]
     clean = [l for l in lines if not any(p in l.lower() for p in noise)]
     result = "\n".join(clean).strip()
@@ -473,22 +466,22 @@ def process_message(incoming_msg, sender):
                     send_whatsapp(sender, result)
                     return
 
-            # yfinance for oil & FX (fast, reliable)
+            # Load history first — always
+            history = load_history(sender)
+            history.append({"role": "user", "content": incoming_msg})
+
+            # yfinance shortcut for specific oil/FX terms — still saves to history
             if is_yf_query(incoming_msg) and not is_saudi_query(incoming_msg):
                 market_data = get_yf_data(incoming_msg)
                 if market_data:
-                    send_whatsapp(sender, market_data)
-                    history = load_history(sender)
-                    history.append({"role": "user", "content": incoming_msg})
                     history.append({"role": "assistant", "content": market_data})
                     if len(history) > MAX_HISTORY:
                         history = history[-MAX_HISTORY:]
                     save_history(sender, history)
+                    send_whatsapp(sender, market_data)
                     return
 
-            # Everything else (including Saudi market) → Claude with web search
-            history = load_history(sender)
-            history.append({"role": "user", "content": incoming_msg})
+            # Everything else → Claude with full history and web search
             reply = call_claude(history)
             history.append({"role": "assistant", "content": reply})
             if len(history) > MAX_HISTORY:
