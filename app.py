@@ -484,7 +484,11 @@ def list_reminders_raw() -> list:
     try:
         with _gs_lock:
             records = _open_sheet().worksheet("Reminders").get_all_records()
-        return [r for r in records if r.get("status") == "pending"]
+        return [
+            {**r, "_row": i + 2}
+            for i, r in enumerate(records)
+            if r.get("status") == "pending"
+        ]
     except Exception as e:
         print(f"[REMINDER] list error: {e}", flush=True)
         return []
@@ -578,7 +582,7 @@ def reminder_scheduler():
                     due_time = datetime.strptime(r["due"], "%Y-%m-%d %H:%M").replace(tzinfo=AST)
                     if now >= due_time:
                         send_whatsapp(OWNER_NUMBER, f"⏰ *Reminder:* {r['message']}")
-                        mark_reminder_done(r["_row"] if "_row" in r else 0, r["recurrence"], r["due"])
+                        mark_reminder_done(r["_row"], r["recurrence"], r["due"])
                         print(f"[SCHEDULER] Fired: {r['message']}", flush=True)
                 except Exception:
                     pass
