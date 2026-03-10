@@ -72,6 +72,7 @@ TWILIO_SID    = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_NUMBER = os.environ.get("TWILIO_NUMBER", "whatsapp:+14155238886")
 OWNER_NUMBER  = os.environ.get("OWNER_NUMBER", "whatsapp:+966553424848")
+print(f"[CONFIG] TWILIO_NUMBER={TWILIO_NUMBER} OWNER_NUMBER={OWNER_NUMBER}", flush=True)
 twilio_client    = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
 twilio_validator = RequestValidator(TWILIO_TOKEN)
 
@@ -463,7 +464,7 @@ def send_whatsapp(to: str, text: str):
     for i, chunk in enumerate(split_message(text)):
         try:
             twilio_client.messages.create(body=chunk, from_=TWILIO_NUMBER, to=to)
-            print(f"[SENT] -> {to} chunk {i+1}: {chunk[:60]}", flush=True)
+            print(f"[SENT] from={TWILIO_NUMBER} -> {to} chunk {i+1}: {chunk[:60]}", flush=True)
             if i > 0:
                 time.sleep(0.4)
         except Exception as e:
