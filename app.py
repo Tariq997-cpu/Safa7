@@ -546,6 +546,7 @@ OWNER_SYSTEM_PROMPT = """You are Safa7 -- a sharp, discreet personal assistant f
 PRIMARY JOB: Tasks, team, priorities, meetings, follow-ups, reminders.
 
 MEMORY: Profile facts = long-term memory. History = short-term. If it's in either -- you know it. Never say "I don't have that information."
+Outbound messages you sent are stored in history as [Outbound to Name]: message text. Use these to answer questions like "what did you send Bandar" or "show me the last message to the team".
 
 REMINDERS -- CRITICAL RULES:
 When asked to set a reminder, respond with EXACTLY this format and nothing else:
@@ -649,7 +650,11 @@ def extract_and_save_reminder(reply: str) -> str:
 
 # ━━━ Team Message Extraction ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def extract_and_send_team_msg(reply: str) -> str:
+def extract_and_send_team_msg(reply: str, sent_log: list = None) -> str:
+    """
+    Parse and send TEAM_MSG blocks. Appends sent message records to sent_log
+    so the caller can store them in conversation history.
+    """
     if "TEAM_MSG:" not in reply:
         return reply
     try:
@@ -673,6 +678,8 @@ def extract_and_send_team_msg(reply: str) -> str:
                     send_whatsapp(contact["phone"], message)
                     sent_names.append(name)
                     print(f"[TEAM] Sent to {name}: {message[:60]}", flush=True)
+                    if sent_log is not None:
+                        sent_log.append({"to": name, "message": message})
                 else:
                     missing.append(name)
             except Exception as e:
@@ -1068,13 +1075,21 @@ def process_message(incoming_msg: str, sender: str):
                                 "\u26a0\ufe0f No phone number for *" + to_name + "*. "
                                 "Add with: `!addcontact " + to_name + ": +9665xxxxxxxx` then try again."
                             )
+                            send_whatsapp(sender, result)
                         else:
                             send_whatsapp(to_phone, message)
                             delete_draft(did)
                             if not get_contact(to_phone):
                                 save_contact(to_name, to_phone, "vendor")
                             result = "\u2705 Sent to *" + to_name + "*."
-                        send_whatsapp(sender, result)
+                            send_whatsapp(sender, result)
+                            # Log the outbound message into owner history
+                            history, profile, _ = load_all(sender)
+                            log_entry = "[Outbound to " + to_name + "]: " + message
+                            history.append({"role": "assistant", "content": log_entry})
+                            if len(history) > MAX_HISTORY:
+                                history = history[-MAX_HISTORY:]
+                            save_history(sender, history)
                         return
 
                 if low_msg.startswith("!drafts"):
@@ -1136,8 +1151,16 @@ def process_message(incoming_msg: str, sender: str):
 
                 reply = call_claude(history, profile)
                 reply = extract_and_save_reminder(reply)
-                reply = extract_and_send_team_msg(reply)
+                sent_log = []
+                reply = extract_and_send_team_msg(reply, sent_log)
                 reply = extract_outreach(reply)
+
+                # Store outbound team messages in history so Safa7 can recall them
+                for entry in sent_log:
+                    history.append({
+                        "role": "assistant",
+                        "content": "[Outbound to " + entry["to"] + "]: " + entry["message"]
+                    })
 
                 history.append({"role": "assistant", "content": reply})
                 if len(history) > MAX_HISTORY:
